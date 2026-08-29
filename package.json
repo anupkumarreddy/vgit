@@ -1,0 +1,57 @@
+{
+  "name": "vgit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A visual, safe, and fast desktop Git client",
+  "license": "MIT",
+  "author": {
+    "name": "Anup Kumar Reddy",
+    "url": "https://github.com/anupkumarreddy"
+  },
+  "homepage": "https://github.com/anupkumarreddy/vgit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anupkumarreddy/vgit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/anupkumarreddy/vgit/issues"
+  },
+  "keywords": [
+    "electron",
+    "git",
+    "git-client",
+    "git-graph",
+    "developer-tools"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "copy:preload": "node scripts/copy-preload.mjs",
+    "dev": "npm run copy:preload && concurrently -k \"vite --host 127.0.0.1\" \"tsc -p tsconfig.electron.json --watch --preserveWatchOutput\" \"wait-on tcp:5173 file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "tsc -p tsconfig.electron.json && npm run copy:preload && tsc --noEmit && vite build",
+    "start": "electron .",
+    "test": "vitest run",
+    "check": "npm run test && npm run build"
+  },
+  "dependencies": {
+    "lucide-react": "^1.37.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "cross-env": "^10.1.0",
+    "electron": "^44.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11",
+    "wait-on": "^9.1.0"
+  }
+}
