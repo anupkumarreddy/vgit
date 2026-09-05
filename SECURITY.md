@@ -12,4 +12,6 @@ Include the affected version, reproduction steps, expected impact, and any sugge
 
 ## Security design
 
-VGit executes the installed system Git binary from Electron's main process using argument arrays. The renderer is sandboxed, has no Node.js integration, and receives only a narrow context-isolated API. Secrets must never be stored in application logs or committed to this repository.
+VGit is a native Rust application. It is currently a UI prototype that does not execute Git, access repositories, or perform network operations; all displayed data is fictional and held in memory.
+
+As real repository support lands, VGit will execute the installed system Git binary using argument arrays rather than interpolated shell commands, destructive operations will require explicit confirmation, and Git authentication will be delegated to the user's existing credential helpers and SSH agent. Secrets must never be stored in application logs or committed to this repository.

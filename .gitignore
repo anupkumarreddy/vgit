@@ -1,6 +1,3 @@
-node_modules/
-dist/
-dist-electron/
 .idea/
 .venv/
 .vscode/
@@ -9,8 +6,6 @@ Thumbs.db
 *.log
 .env*
 !.env.example
-coverage/
-release/
 out/
 native/target/
 *.dmg

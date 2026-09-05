@@ -6,7 +6,15 @@ end_of_line = lf
 insert_final_newline = true
 trim_trailing_whitespace = true
 
-[*.{ts,tsx,js,cjs,json,yml,yaml}]
+[*.rs]
+indent_style = space
+indent_size = 4
+
+[*.{toml,yml,yaml,json}]
+indent_style = space
+indent_size = 2
+
+[*.sh]
 indent_style = space
 indent_size = 2
 
