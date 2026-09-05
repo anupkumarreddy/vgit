@@ -8,11 +8,10 @@ VGit is an open-source visual desktop Git client written in Rust with
 [GPUI](https://www.gpui.rs/). It presents commits, branches, tags, remotes,
 hashes, authors, and merge paths as an approachable repository map.
 
-> **Status: VGit reads and writes real repositories.** It opens the repository
-> it is launched from and shows its real history, diffs, changes, and refs.
-> Staging, unstaging, and committing work. Fetch, pull, push, branch
-> switching, and the destructive operations are implemented and tested in the
-> Git layer but are not yet reachable from a control. See
+> **Status: a working visual Git client.** VGit opens the repository it is
+> launched from, or any other through **Open**, and every Git operation it
+> implements is reachable from the interface. Anything that can lose work asks
+> first, naming exactly what will be lost. See
 > [Project status and roadmap](#project-status-and-roadmap).
 
 VGit was previously an Electron, React, and TypeScript application. That
@@ -47,7 +46,23 @@ open 'out/VGit Preview.app'
 
 The local bundle is unsigned and intended for development only.
 
-## Explore the prototype
+## Operations
+
+| Where | What |
+| --- | --- |
+| Title bar | **Open** another repository, **Fetch**, **Pull** (fast-forward only), **Push**, and `⋯` for repository actions |
+| History header | `↻` refresh, **Branches**, **Columns** |
+| Repository panel | **actions** beside the selected commit: check out, revert, reset soft/mixed/hard, amend |
+| Branches picker | choose which branches the graph draws, or **switch** to one |
+| Repository picker | create a branch, stash and restore, delete untracked files |
+| Change rows | `+`/`−` stage and unstage, `⟲` discards that file |
+| Commit box | type a message, then **Commit** |
+
+Hard reset, discard, clean, and amend open a confirmation naming what will be
+lost. Pull is fast-forward only, so it can never quietly create a merge
+commit. Push sets the upstream when the branch has none.
+
+## Explore
 
 - **Repository graph:** every branch keeps its own colored rail. Lanes are
   derived from the commit graph rather than stored on a commit, so the layout
@@ -124,14 +139,13 @@ staging, unstaging, and committing work. The fixture has been removed.
 
 Near-term work, in rough order:
 
-1. Wire fetch, fast-forward pull, and push, with progress and error reporting
-2. Wire amend, revert, and branch switching
-3. Wire the destructive operations behind explicit confirmation: hard reset,
-   discard, and clean
-4. Open an arbitrary repository rather than the launch directory
-5. A real text editor for the commit message, replacing the minimal input
-6. Search across commit message, author, hash, branch, and tag
-7. Conflict resolution, line and hunk staging, and interactive rebase
+1. A real text editor for commit messages, replacing the minimal input
+2. Progress reporting for long fetches and pushes
+3. Search across commit message, author, hash, branch, and tag
+4. Conflict resolution, line and hunk staging, and interactive rebase
+5. Branch deletion, tag creation, and remote management
+6. Recently opened repositories, and remembering the last one
+7. Reflog recovery, worktrees, submodules, and Git LFS
 
 Later work includes interactive rebase, three-way conflict resolution, line and
 hunk staging, reflog recovery, worktrees, submodules, Git LFS,

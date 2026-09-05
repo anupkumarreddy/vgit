@@ -2,13 +2,13 @@
 
 A visual Git client written entirely in Rust with GPUI.
 
-VGit opens the repository it is launched from and shows its real history,
-diffs, changes, and refs. Staging, unstaging, and committing act on that
-repository. There is no fixture data left in the application.
+VGit opens the repository it is launched from, or any other through **Open**,
+and shows its real history, diffs, changes, and refs. Every Git operation it
+implements is reachable from the interface.
 
-Not yet implemented: fetch, pull, push, branch switching, and the destructive
-operations. The Git layer supports them all and they are covered by tests;
-none of them are reachable from a control yet.
+Anything that can lose work asks first. Hard reset, discard, clean, and amend
+open a confirmation naming exactly what will be lost; nothing destructive
+fires straight from a button.
 
 ## Run
 
@@ -31,6 +31,21 @@ open 'out/VGit Preview.app'
 
 The local bundle is unsigned and intended for development. The prototype has
 been developed on macOS; Windows and Linux packaging is not yet validated.
+
+## Operations
+
+| Where | What |
+| --- | --- |
+| Title bar | **Open** another repository, **Fetch**, **Pull** (fast-forward only), **Push**, and `⋯` for repository actions |
+| History header | `↻` refresh, **Branches**, **Columns** |
+| Repository panel | **actions** beside the selected commit: check out, revert, reset soft/mixed/hard, amend |
+| Branches picker | choose which branches the graph draws, or **switch** to one |
+| Repository picker | create a branch, stash and restore, delete untracked files |
+| Change rows | `+`/`−` stage and unstage, `⟲` discards that file |
+| Commit box | type a message, then **Commit** |
+
+Pull is fast-forward only, so it can never quietly create a merge commit.
+Push sets the upstream when the branch has none.
 
 ## Explore
 

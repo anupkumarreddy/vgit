@@ -485,6 +485,11 @@ impl Repository {
         self.run_unit(&["switch", "--create", name])
     }
 
+    /// Checks out a commit directly, leaving HEAD detached.
+    pub fn checkout_commit(&self, commit: &str) -> Result<()> {
+        self.run_unit(&["switch", "--detach", commit])
+    }
+
     /// Deletes a branch, refusing if it holds unmerged commits.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         self.run_unit(&["branch", "--delete", name])
@@ -1382,6 +1387,35 @@ mod tests {
         let diff = temp.open().diff("a.txt", false).expect("diff");
         assert!(diff.contains("-one"), "{diff}");
         assert!(diff.contains("+two"), "{diff}");
+    }
+
+    #[test]
+    fn checking_out_a_commit_detaches_head_at_it() {
+        let temp = TempRepo::new("detach-at");
+        temp.commit_file("a.txt", "a\n", "First");
+        temp.commit_file("b.txt", "b\n", "Second");
+        let repo = temp.open();
+        let first = repo.log(10).expect("log")[1].id.clone();
+
+        repo.checkout_commit(&first).expect("checkout");
+
+        let status = repo.status().expect("status");
+        assert!(status.detached);
+        assert_eq!(status.head.as_deref(), Some(first.as_str()));
+        assert!(!temp.exists("b.txt"), "the later commit's file is gone");
+    }
+
+    #[test]
+    fn cleaning_removes_untracked_files_only() {
+        let temp = TempRepo::new("clean");
+        temp.commit_file("kept.txt", "kept\n", "Initial commit");
+        temp.write("loose.txt", "loose\n");
+        let repo = temp.open();
+
+        repo.clean(true).expect("clean");
+
+        assert!(temp.exists("kept.txt"), "a tracked file must survive");
+        assert!(!temp.exists("loose.txt"), "the untracked file is gone");
     }
 
     #[test]

@@ -181,6 +181,41 @@ enum Popover {
     Settings,
     Columns,
     Branches,
+    Commit,
+    Repository,
+}
+
+/// Which single-line field is taking keystrokes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Field {
+    CommitMessage,
+    BranchName,
+    StashMessage,
+}
+
+impl Field {
+    fn placeholder(self) -> &'static str {
+        match self {
+            Field::CommitMessage => "Commit message",
+            Field::BranchName => "New branch name",
+            Field::StashMessage => "Stash message",
+        }
+    }
+}
+
+/// A repository write, deferred until it is either confirmed or run.
+type Operation = Box<dyn FnOnce(&git::Repository) -> git::Result<()> + Send>;
+
+/// A destructive action held until the user confirms it.
+///
+/// Everything that can lose committed or uncommitted work goes through here
+/// rather than firing straight from a button.
+struct Confirm {
+    title: String,
+    detail: String,
+    /// What the status bar reports once it succeeds.
+    outcome: String,
+    action: Operation,
 }
 
 /// Editor typography. A single monospace measure is shared by the diff and
@@ -222,9 +257,11 @@ struct Workspace {
     /// Pointer x and sidebar width captured when a resize drag begins.
     resize_origin: Option<(f32, f32)>,
     popover: Popover,
-    /// The commit message being typed, and whether keys are going into it.
-    commit_message: String,
-    composing: bool,
+    /// Text typed into each single-line field, and which one has the keys.
+    inputs: HashMap<Field, String>,
+    composing: Option<Field>,
+    /// A destructive action waiting to be confirmed.
+    confirm: Option<Confirm>,
     /// Background reads, held so they are not cancelled on drop.
     tasks: Vec<gpui::Task<()>>,
     message: String,
@@ -372,8 +409,9 @@ impl Workspace {
             sidebar_width: SIDEBAR_DEFAULT,
             resize_origin: None,
             popover: Popover::None,
-            commit_message: String::new(),
-            composing: false,
+            inputs: HashMap::new(),
+            composing: None,
+            confirm: None,
             tasks: Vec::new(),
             message: "Reading repository…".into(),
         };
@@ -774,15 +812,15 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let message = self.commit_message.trim().to_string();
+        let message = self.input(Field::CommitMessage).trim().to_string();
         if message.is_empty() {
-            self.composing = true;
+            self.composing = Some(Field::CommitMessage);
             self.message = "Type a commit message first".into();
             cx.notify();
             return;
         }
-        self.commit_message.clear();
-        self.composing = false;
+        self.inputs.remove(&Field::CommitMessage);
+        self.composing = None;
         let subject = message.clone();
         self.perform(
             format!("Committed: {subject}"),
@@ -791,18 +829,28 @@ impl Workspace {
         );
     }
 
-    /// Handles a keystroke aimed at the commit message field. Returns whether
-    /// the key was consumed, so the caller can stop it reaching the actions.
-    fn type_into_message(&mut self, event: &gpui::KeyDownEvent) -> bool {
-        if !self.composing {
+    fn input(&self, field: Field) -> &str {
+        self.inputs.get(&field).map(String::as_str).unwrap_or("")
+    }
+
+    fn focus_field(&mut self, field: Field, cx: &mut Context<Self>) {
+        self.composing = Some(field);
+        cx.notify();
+    }
+
+    /// Handles a keystroke aimed at whichever field is focused. Returns
+    /// whether the key was consumed, so the caller can stop it reaching the
+    /// key bindings and staging a file mid-word.
+    fn type_into_field(&mut self, event: &gpui::KeyDownEvent) -> bool {
+        let Some(field) = self.composing else {
             return false;
-        }
+        };
         let keystroke = &event.keystroke;
         let commanding = keystroke.modifiers.platform || keystroke.modifiers.control;
         match keystroke.key.as_str() {
-            "escape" => self.composing = false,
+            "escape" => self.composing = None,
             "backspace" => {
-                self.commit_message.pop();
+                self.inputs.entry(field).or_default().pop();
             }
             "enter" => return !commanding,
             _ => {
@@ -810,15 +858,314 @@ impl Workspace {
                     return false;
                 }
                 match keystroke.key_char.as_deref() {
-                    // Control characters are not message text.
+                    // Control characters are not field text.
                     Some(text) if !text.chars().any(char::is_control) => {
-                        self.commit_message.push_str(text)
+                        self.inputs.entry(field).or_default().push_str(text)
                     }
                     _ => return false,
                 }
             }
         }
         true
+    }
+
+    /// Queues a destructive action for confirmation instead of running it.
+    fn ask(
+        &mut self,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        outcome: impl Into<String>,
+        action: impl FnOnce(&git::Repository) -> git::Result<()> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm = Some(Confirm {
+            title: title.into(),
+            detail: detail.into(),
+            outcome: outcome.into(),
+            action: Box::new(action),
+        });
+        cx.notify();
+    }
+
+    fn run_confirmed(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirm.take() else {
+            return;
+        };
+        self.perform(confirm.outcome, confirm.action, cx);
+    }
+
+    /// The remote to talk to. Git's own default is `origin`.
+    fn remote(&self) -> String {
+        self.data()
+            .and_then(|data| data.status.upstream.as_ref())
+            .and_then(|upstream| upstream.split_once('/'))
+            .map(|(remote, _)| remote.to_string())
+            .unwrap_or_else(|| "origin".to_string())
+    }
+
+    fn branch(&self) -> Option<String> {
+        self.data().and_then(|data| data.status.branch.clone())
+    }
+
+    fn fetch(&mut self, cx: &mut Context<Self>) {
+        let remote = self.remote();
+        self.perform(
+            format!("Fetched {remote}"),
+            move |repository| repository.fetch(&remote, true),
+            cx,
+        );
+    }
+
+    fn pull(&mut self, cx: &mut Context<Self>) {
+        let (remote, Some(branch)) = (self.remote(), self.branch()) else {
+            self.message = "Detached HEAD has nothing to pull into".into();
+            cx.notify();
+            return;
+        };
+        self.perform(
+            format!("Pulled {remote}/{branch}"),
+            move |repository| repository.pull_fast_forward(&remote, &branch),
+            cx,
+        );
+    }
+
+    fn push(&mut self, cx: &mut Context<Self>) {
+        let (remote, Some(branch)) = (self.remote(), self.branch()) else {
+            self.message = "Detached HEAD has nothing to push".into();
+            cx.notify();
+            return;
+        };
+        // Setting upstream is harmless when one already exists.
+        let set_upstream = self
+            .data()
+            .map(|data| data.status.upstream.is_none())
+            .unwrap_or(true);
+        self.perform(
+            format!("Pushed {branch} to {remote}"),
+            move |repository| repository.push(&remote, &branch, set_upstream),
+            cx,
+        );
+    }
+
+    fn amend(&mut self, cx: &mut Context<Self>) {
+        let typed = self.input(Field::CommitMessage).trim().to_string();
+        let subject = self
+            .commits()
+            .first()
+            .map(|commit| commit.subject.clone())
+            .unwrap_or_default();
+        self.inputs.remove(&Field::CommitMessage);
+        self.composing = None;
+        self.ask(
+            "Amend the last commit?",
+            format!(
+                "Replaces {subject:?}. The original stays in the reflog, but if it \
+                 was already pushed the branch will have diverged."
+            ),
+            "Amended the last commit".to_string(),
+            move |repository| {
+                if typed.is_empty() {
+                    repository.amend_keep_message()
+                } else {
+                    repository.amend(&typed)
+                }
+            },
+            cx,
+        );
+    }
+
+    fn revert_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(commit) = self.selected_commit().cloned() else {
+            return;
+        };
+        let id = commit.id.clone();
+        self.perform(
+            format!("Reverted {}", commit.short_id),
+            move |repository| repository.revert(&id),
+            cx,
+        );
+    }
+
+    fn reset_to_selected(&mut self, mode: git::ResetMode, cx: &mut Context<Self>) {
+        let Some(commit) = self.selected_commit().cloned() else {
+            return;
+        };
+        let id = commit.id.clone();
+        let label = match mode {
+            git::ResetMode::Soft => "soft",
+            git::ResetMode::Mixed => "mixed",
+            git::ResetMode::Hard => "hard",
+        };
+        let outcome = format!("Reset {label} to {}", commit.short_id);
+
+        if mode.is_destructive() {
+            self.ask(
+                format!("Hard reset to {}?", commit.short_id),
+                format!(
+                    "Moves the branch to {:?} and throws away every uncommitted \
+                     change in the index and the working tree. This cannot be undone \
+                     through Git.",
+                    commit.subject
+                ),
+                outcome,
+                move |repository| repository.reset(&id, mode),
+                cx,
+            );
+        } else {
+            self.perform(outcome, move |repository| repository.reset(&id, mode), cx);
+        }
+    }
+
+    fn checkout_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(commit) = self.selected_commit().cloned() else {
+            return;
+        };
+        let id = commit.id.clone();
+        self.perform(
+            format!("Checked out {} (detached)", commit.short_id),
+            move |repository| repository.checkout_commit(&id),
+            cx,
+        );
+    }
+
+    fn switch_to_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        let name = branch.clone();
+        self.perform(
+            format!("Switched to {branch}"),
+            move |repository| repository.switch_branch(&name),
+            cx,
+        );
+    }
+
+    fn create_branch(&mut self, cx: &mut Context<Self>) {
+        let name = self.input(Field::BranchName).trim().to_string();
+        if name.is_empty() {
+            self.focus_field(Field::BranchName, cx);
+            self.message = "Type a branch name first".into();
+            return;
+        }
+        self.inputs.remove(&Field::BranchName);
+        self.composing = None;
+        let branch = name.clone();
+        self.perform(
+            format!("Created and switched to {branch}"),
+            move |repository| repository.create_and_switch(&name),
+            cx,
+        );
+    }
+
+    fn stash(&mut self, cx: &mut Context<Self>) {
+        let typed = self.input(Field::StashMessage).trim().to_string();
+        let message = if typed.is_empty() {
+            "VGit stash".to_string()
+        } else {
+            typed
+        };
+        self.inputs.remove(&Field::StashMessage);
+        self.composing = None;
+        self.perform(
+            format!("Stashed: {message}"),
+            move |repository| repository.stash_push(&message, true),
+            cx,
+        );
+    }
+
+    fn stash_pop(&mut self, cx: &mut Context<Self>) {
+        self.perform(
+            "Restored the latest stash".into(),
+            |repository| repository.stash_pop(),
+            cx,
+        );
+    }
+
+    /// Throws away one path's working-tree changes. Destructive.
+    fn discard_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(file) = self.changes().get(index).cloned() else {
+            return;
+        };
+        let path = file.path.clone();
+        if file.untracked {
+            self.message = format!("{path} is untracked; use Clean to remove it");
+            cx.notify();
+            return;
+        }
+        self.ask(
+            format!("Discard changes to {path}?"),
+            "Throws away every uncommitted change to this file. This cannot be \
+             undone through Git."
+                .to_string(),
+            format!("Discarded {path}"),
+            move |repository| repository.discard(&[&path]),
+            cx,
+        );
+    }
+
+    /// Deletes every untracked file. Destructive, and not undoable at all.
+    fn clean(&mut self, cx: &mut Context<Self>) {
+        let count = self
+            .data()
+            .map(|data| data.status.files.iter().filter(|f| f.untracked).count())
+            .unwrap_or(0);
+        if count == 0 {
+            self.message = "There are no untracked files".into();
+            cx.notify();
+            return;
+        }
+        self.ask(
+            format!("Delete {count} untracked file(s)?"),
+            "Removes untracked files and directories from disk. Git never had \
+             them, so this cannot be undone at all."
+                .to_string(),
+            format!("Deleted {count} untracked file(s)"),
+            |repository| repository.clean(true),
+            cx,
+        );
+    }
+
+    /// Opens a different repository, using the platform folder picker.
+    fn open_repository(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(chosen))) = paths.await else {
+                return;
+            };
+            let Some(path) = chosen.into_iter().next() else {
+                return;
+            };
+            let opened = cx
+                .background_executor()
+                .spawn(async move { git::Repository::discover(&path).map_err(|e| e.to_string()) })
+                .await;
+
+            this.update(cx, |workspace, cx| {
+                match opened {
+                    Ok(repository) => {
+                        workspace.message = format!("Opened {}", repository.root().display());
+                        workspace.repository = Some(repository);
+                        // Nothing from the previous repository still applies.
+                        workspace.repo = RepoState::Loading;
+                        workspace.visible_branches.clear();
+                        workspace.tabs.clear();
+                        workspace.active_tab = 0;
+                        workspace.commit = 0;
+                        workspace.file = 0;
+                        workspace.collapsed.clear();
+                        workspace.popover = Popover::None;
+                        workspace.reload(cx);
+                    }
+                    Err(error) => workspace.message = error,
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.tasks.push(task);
     }
 
     fn stage_all(&mut self, cx: &mut Context<Self>) {
@@ -849,6 +1196,35 @@ impl Workspace {
 
     fn titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
+        let name = self
+            .data()
+            .map(|data| {
+                data.root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| data.root.display().to_string())
+            })
+            .unwrap_or_else(|| "no repository".into());
+        let summary = match &self.repo {
+            RepoState::Ready(data) => format!(
+                "{}   ·   {}   ·   {}",
+                name,
+                data.status
+                    .head
+                    .as_deref()
+                    .map(|id| id[..7.min(id.len())].to_string())
+                    .unwrap_or_else(|| "unborn".into()),
+                data.status
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "detached".into())
+            ),
+            RepoState::Loading => "Reading…".into(),
+            RepoState::Failed(reason) => reason.clone(),
+        };
+        let ahead = self.data().map(|data| data.status.ahead).unwrap_or(0);
+        let behind = self.data().map(|data| data.status.behind).unwrap_or(0);
+
         row()
             .h(px(36.))
             .flex_none()
@@ -860,18 +1236,11 @@ impl Workspace {
             .border_color(rgb(colors.line))
             .child(
                 row()
-                    .w(px(252.))
                     .gap_2()
                     .text_size(px(14.))
                     .text_color(rgb(colors.text_bright))
                     .child(div().text_color(rgb(colors.local)).child("◇"))
-                    .child("vgit")
-                    .child(div().text_color(rgb(colors.dim)).child("—"))
-                    .child(
-                        div()
-                            .text_color(rgb(colors.muted))
-                            .child("design-workspace"),
-                    ),
+                    .child("vgit"),
             )
             .child(
                 row()
@@ -886,16 +1255,54 @@ impl Workspace {
                     .bg(rgb(colors.elevated))
                     .text_size(px(13.))
                     .text_color(rgb(colors.muted))
-                    .child("design-workspace   ·   e7a91c2   ·   main"),
+                    .child(div().min_w_0().truncate().child(summary)),
             )
             .child(div().flex_1())
             .child(
+                button(colors, "open-repository", "⌂  Open").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.open_repository(cx);
+                    },
+                )),
+            )
+            .child(
                 button(colors, "fetch", "↓  Fetch").on_click(cx.listener(|this, _, _, cx| {
-                    this.message = "origin/main is up to date · demo only".into();
-                    cx.notify();
+                    this.fetch(cx);
                 })),
             )
-            .child(button(colors, "push", "↑  Push 1"))
+            .child(
+                button(
+                    colors,
+                    "pull",
+                    if behind > 0 {
+                        format!("⇣  Pull {behind}")
+                    } else {
+                        "⇣  Pull".to_string()
+                    },
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.pull(cx);
+                })),
+            )
+            .child(
+                button(
+                    colors,
+                    "push",
+                    if ahead > 0 {
+                        format!("↑  Push {ahead}")
+                    } else {
+                        "↑  Push".to_string()
+                    },
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.push(cx);
+                })),
+            )
+            .child(button(colors, "repository-menu", "⋯").on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.toggle_popover(Popover::Repository, cx);
+                },
+            )))
     }
 
     fn activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1581,6 +1988,21 @@ impl Workspace {
             )
             .child(
                 div()
+                    .id(("discard-file", index))
+                    .w(px(18.))
+                    .text_center()
+                    .text_size(px(13.))
+                    .text_color(rgb(colors.dim))
+                    .cursor_pointer()
+                    .hover(move |this| this.text_color(rgb(colors.red)))
+                    .child("⟲")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.discard_file(index, cx);
+                    })),
+            )
+            .child(
+                div()
                     .id(("stage-toggle", index))
                     .w(px(18.))
                     .text_center()
@@ -1754,7 +2176,25 @@ impl Workspace {
                             .gap_1()
                             .border_t_1()
                             .border_color(rgb(colors.line))
-                            .child(section_label(colors, "SELECTED COMMIT"))
+                            .child(
+                                row()
+                                    .child(section_label(colors, "SELECTED COMMIT"))
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .id("open-commit-actions")
+                                            .px_1()
+                                            .rounded(px(3.))
+                                            .text_size(px(11.))
+                                            .text_color(rgb(colors.remote))
+                                            .cursor_pointer()
+                                            .hover(move |this| this.bg(rgb(colors.line_strong)))
+                                            .child("actions")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_popover(Popover::Commit, cx);
+                                            })),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .text_size(px(13.))
@@ -1980,15 +2420,17 @@ impl Workspace {
                             .id("commit-message")
                             .cursor_text()
                             .text_size(px(13.))
-                            .when(self.composing, |this| this.border_color(rgb(colors.local)))
-                            .text_color(rgb(if self.commit_message.is_empty() {
+                            .when(self.composing == Some(Field::CommitMessage), |this| {
+                                this.border_color(rgb(colors.local))
+                            })
+                            .text_color(rgb(if self.input(Field::CommitMessage).is_empty() {
                                 colors.dim
                             } else {
                                 colors.text
                             }))
-                            .child(if !self.commit_message.is_empty() {
-                                self.commit_message.clone()
-                            } else if self.composing {
+                            .child(if !self.input(Field::CommitMessage).is_empty() {
+                                self.input(Field::CommitMessage).to_string()
+                            } else if self.composing == Some(Field::CommitMessage) {
                                 "Type a message, Escape to stop".to_string()
                             } else if staged_count == 0 {
                                 "Stage a change to commit".to_string()
@@ -1996,8 +2438,7 @@ impl Workspace {
                                 "Select here to write a message".to_string()
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.composing = true;
-                                cx.notify();
+                                this.focus_field(Field::CommitMessage, cx);
                             })),
                     )
                     .child(
@@ -2188,6 +2629,25 @@ impl Workspace {
                             .child("HEAD"),
                     )
                 })
+                .child(
+                    div()
+                        .id(("switch-branch", index))
+                        .px_1()
+                        .rounded(px(3.))
+                        .text_size(px(11.))
+                        .text_color(rgb(colors.remote))
+                        .cursor_pointer()
+                        .hover(move |this| this.bg(rgb(colors.line_strong)))
+                        .child("switch")
+                        .on_click(cx.listener({
+                            let branch = branch.clone();
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.popover = Popover::None;
+                                this.switch_to_branch(branch.clone(), cx);
+                            }
+                        })),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_branch(name.clone(), cx);
                 }))
@@ -2208,6 +2668,303 @@ impl Workspace {
                         this.commit = 0;
                         this.reload(cx);
                     })),
+            )
+    }
+
+    /// A single-line text field. Minimal: typing and backspace, nothing more.
+    fn text_field(&self, field: Field, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let text = self.input(field).to_string();
+        let focused = self.composing == Some(field);
+        row()
+            .id(SharedString::from(format!("field-{}", field.placeholder())))
+            .h(px(28.))
+            .px_2()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(rgb(if focused {
+                colors.local
+            } else {
+                colors.line_strong
+            }))
+            .bg(rgb(colors.editor))
+            .cursor_text()
+            .text_size(px(13.))
+            .text_color(rgb(if text.is_empty() {
+                colors.dim
+            } else {
+                colors.text
+            }))
+            .child(div().min_w_0().truncate().child(if text.is_empty() {
+                if focused {
+                    format!("{} — Escape to stop", field.placeholder())
+                } else {
+                    field.placeholder().to_string()
+                }
+            } else {
+                text
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.focus_field(field, cx);
+            }))
+    }
+
+    /// What can be done with the selected commit.
+    fn commit_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let commit = self.selected_commit().cloned();
+        let is_head = commit
+            .as_ref()
+            .zip(self.data())
+            .map(|(commit, data)| Some(&commit.id) == data.status.head.as_ref())
+            .unwrap_or(false);
+        let subject = commit
+            .as_ref()
+            .map(|commit| format!("{}  {}", commit.short_id, commit.subject))
+            .unwrap_or_else(|| "No commit selected".into());
+
+        let action = |id: &'static str, label: &'static str, detail: &'static str, danger: bool| {
+            column()
+                .id(id)
+                .p_2()
+                .gap_1()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(rgb(if danger {
+                    colors.red
+                } else {
+                    colors.line_strong
+                }))
+                .cursor_pointer()
+                .hover(move |this| this.bg(rgb(colors.hover)))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgb(if danger { colors.red } else { colors.text }))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(colors.dim))
+                        .child(detail),
+                )
+        };
+
+        self.picker("commit-panel", "Commit", cx)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.muted))
+                    .child(subject),
+            )
+            .child(section_label(colors, "SAFE"))
+            .child(
+                action(
+                    "action-checkout",
+                    "Check out",
+                    "Detach HEAD at this commit",
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.popover = Popover::None;
+                    this.checkout_selected(cx);
+                })),
+            )
+            .child(
+                action(
+                    "action-revert",
+                    "Revert",
+                    "Add a commit that undoes this one",
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.popover = Popover::None;
+                    this.revert_selected(cx);
+                })),
+            )
+            .child(
+                action(
+                    "action-reset-soft",
+                    "Reset soft",
+                    "Move the branch here, keep changes staged",
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.popover = Popover::None;
+                    this.reset_to_selected(git::ResetMode::Soft, cx);
+                })),
+            )
+            .child(
+                action(
+                    "action-reset-mixed",
+                    "Reset mixed",
+                    "Move the branch here, keep changes in the working tree",
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.popover = Popover::None;
+                    this.reset_to_selected(git::ResetMode::Mixed, cx);
+                })),
+            )
+            .when(is_head, |this| {
+                this.child(section_label(colors, "REWRITES HISTORY")).child(
+                    action(
+                        "action-amend",
+                        "Amend",
+                        "Replace this commit with what is staged",
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.popover = Popover::None;
+                        this.amend(cx);
+                    })),
+                )
+            })
+            .child(section_label(colors, "DESTROYS WORK"))
+            .child(
+                action(
+                    "action-reset-hard",
+                    "Reset hard",
+                    "Move the branch here and discard everything uncommitted",
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.popover = Popover::None;
+                    this.reset_to_selected(git::ResetMode::Hard, cx);
+                })),
+            )
+    }
+
+    /// Repository-wide actions: branches, stashing, and cleaning.
+    fn repository_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let stashes = self
+            .data()
+            .map(|data| data.status.files.iter().filter(|f| f.untracked).count())
+            .unwrap_or(0);
+
+        self.picker("repository-panel", "Repository", cx)
+            .child(section_label(colors, "NEW BRANCH"))
+            .child(self.text_field(Field::BranchName, cx))
+            .child(
+                button(colors, "create-branch", "Create and switch").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.popover = Popover::None;
+                        this.create_branch(cx);
+                    },
+                )),
+            )
+            .child(section_label(colors, "STASH"))
+            .child(self.text_field(Field::StashMessage, cx))
+            .child(
+                row()
+                    .gap_2()
+                    .child(
+                        button(colors, "stash-push", "Stash changes").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.popover = Popover::None;
+                                this.stash(cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        button(colors, "stash-pop", "Restore stash").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.popover = Popover::None;
+                                this.stash_pop(cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(section_label(colors, "DESTROYS WORK"))
+            .child(
+                row()
+                    .id("clean-untracked")
+                    .h(px(28.))
+                    .px_2()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(rgb(colors.red))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(rgb(colors.red))
+                    .hover(move |this| this.bg(rgb(colors.hover)))
+                    .child(format!("Delete {stashes} untracked file(s)"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.popover = Popover::None;
+                        this.clean(cx);
+                    })),
+            )
+    }
+
+    /// The gate every destructive action passes through.
+    fn confirm_dialog(&self, confirm: &Confirm, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        column()
+            .id("confirm-dialog")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x00000099))
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                column()
+                    .w(px(420.))
+                    .p_4()
+                    .gap_3()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(colors.red))
+                    .bg(rgb(colors.elevated))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(15.))
+                            .text_color(rgb(colors.text_bright))
+                            .child(confirm.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(colors.muted))
+                            .child(confirm.detail.clone()),
+                    )
+                    .child(
+                        row()
+                            .gap_2()
+                            .justify_end()
+                            .child(button(colors, "confirm-cancel", "Cancel").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.confirm = None;
+                                    this.message = "Cancelled".into();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                row()
+                                    .id("confirm-go")
+                                    .h(px(28.))
+                                    .px_3()
+                                    .justify_center()
+                                    .rounded(px(4.))
+                                    .bg(rgb(colors.red))
+                                    .text_color(rgb(colors.editor))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(13.))
+                                    .cursor_pointer()
+                                    .child("Yes, do it")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.run_confirmed(cx);
+                                    })),
+                            ),
+                    ),
             )
     }
 
@@ -2428,13 +3185,15 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &Escape, _, cx| {
                 this.popover = Popover::None;
+                this.confirm = None;
+                this.composing = None;
                 cx.notify();
             }))
             .on_action(|_: &Close, window, _| window.remove_window())
             // Captured before the key bindings run, so typing a message
             // cannot trigger Space to stage or Up to move the selection.
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if this.type_into_message(event) {
+                if this.type_into_field(event) {
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -2485,6 +3244,15 @@ impl Render for Workspace {
             })
             .when(self.popover == Popover::Branches, |this| {
                 this.child(self.branches_panel(cx))
+            })
+            .when(self.popover == Popover::Commit, |this| {
+                this.child(self.commit_panel(cx))
+            })
+            .when(self.popover == Popover::Repository, |this| {
+                this.child(self.repository_panel(cx))
+            })
+            .when_some(self.confirm.as_ref(), |this, confirm| {
+                this.child(self.confirm_dialog(confirm, cx))
             })
     }
 }
