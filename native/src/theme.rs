@@ -39,6 +39,7 @@ impl Theme {
                 tag: 0xc586c0,
                 merge: 0xd7ba7d,
                 red: 0xf48771,
+                lane_alt: 0x4ec9b0,
                 added_bg: 0x1d3328,
                 removed_bg: 0x3a2325,
             },
@@ -65,6 +66,7 @@ impl Theme {
                 tag: 0x8b4a92,
                 merge: 0x9a6700,
                 red: 0xb42318,
+                lane_alt: 0x0f7b6c,
                 added_bg: 0xe6f4ea,
                 removed_bg: 0xfce8e6,
             },
@@ -96,20 +98,23 @@ pub struct Palette {
     pub tag: u32,
     pub merge: u32,
     pub red: u32,
+    /// A fifth rail color, so a full graph never reuses the merge amber.
+    pub lane_alt: u32,
     pub added_bg: u32,
     pub removed_bg: u32,
 }
 
 impl Palette {
     /// A distinct rail color per lane, for as many lanes as the graph gutter
-    /// reserves room for.
+    /// reserves room for. The merge amber is deliberately not reused here, so
+    /// a merge node stays distinguishable from a branch rail.
     pub fn branch(self, lane: usize) -> u32 {
         match lane {
             0 => self.local,
             1 => self.remote,
             2 => self.tag,
-            3 => self.merge,
-            _ => self.red,
+            3 => self.red,
+            _ => self.lane_alt,
         }
     }
 }

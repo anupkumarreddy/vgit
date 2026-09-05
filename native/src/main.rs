@@ -46,23 +46,63 @@ const SIDEBAR_MIN: f32 = 280.;
 const SIDEBAR_MAX: f32 = 760.;
 const SIDEBAR_DEFAULT: f32 = SIDEBAR_MAX;
 
-/// Fixed column widths for the history table. Every cell is the same width on
-/// every row, so the hashes, branches, refs, and messages line up as columns.
-const COL_HASH: f32 = 78.;
-const COL_BRANCH: f32 = 136.;
-const COL_REF: f32 = 116.;
-const COL_MESSAGE: f32 = 430.;
-const COL_TIME: f32 = 70.;
-
-/// Total width of one history row. This is wider than the sidebar can be
-/// dragged, so the table carries its own horizontal scroller.
-const ROW_WIDTH: f32 =
-    graph::GRAPH_WIDTH + COL_HASH + COL_BRANCH + COL_REF + COL_MESSAGE + COL_TIME;
-
-// The table must stay wider than the sidebar, or the horizontal scroller the
-// message column depends on would have nothing to scroll.
-const _: () = assert!(ROW_WIDTH > SIDEBAR_MAX);
 const _: () = assert!(SIDEBAR_DEFAULT >= SIDEBAR_MIN && SIDEBAR_DEFAULT <= SIDEBAR_MAX);
+
+/// A column of the history table. Every cell in a column is the same width on
+/// every row, so hashes, branches, authors, and messages line up down the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Column {
+    Commit,
+    Branch,
+    Author,
+    Message,
+    When,
+}
+
+/// The columns in the order they are laid out.
+const COLUMNS: &[Column] = &[
+    Column::Commit,
+    Column::Branch,
+    Column::Author,
+    Column::Message,
+    Column::When,
+];
+
+impl Column {
+    fn label(self) -> &'static str {
+        match self {
+            Column::Commit => "COMMIT",
+            Column::Branch => "BRANCH",
+            Column::Author => "AUTHOR",
+            Column::Message => "MESSAGE",
+            Column::When => "WHEN",
+        }
+    }
+
+    fn width(self) -> f32 {
+        match self {
+            Column::Commit => 78.,
+            Column::Branch => 158.,
+            Column::Author => 118.,
+            Column::Message => 430.,
+            Column::When => 70.,
+        }
+    }
+
+    /// The message is what the list is for, so it cannot be hidden.
+    fn hideable(self) -> bool {
+        self != Column::Message
+    }
+}
+
+/// Which panel, if any, is open over the workspace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Popover {
+    None,
+    Settings,
+    Columns,
+    Branches,
+}
 
 /// Editor typography. A single monospace measure is shared by the diff and
 /// source views so both line up column for column, with the ~1.55 line height
@@ -85,10 +125,14 @@ struct Workspace {
     files: Vec<FileChange>,
     /// Directories collapsed in the source tree, by path.
     collapsed: HashSet<&'static str>,
+    /// Branches drawn in the graph, at most [`graph::LANE_CAPACITY`] of them.
+    visible_branches: Vec<&'static str>,
+    /// Columns the user has hidden from the history table.
+    hidden_columns: HashSet<Column>,
     sidebar_width: f32,
     /// Pointer x and sidebar width captured when a resize drag begins.
     resize_origin: Option<(f32, f32)>,
-    settings_open: bool,
+    popover: Popover,
     message: String,
 }
 
@@ -179,9 +223,15 @@ impl Workspace {
             file: 0,
             files: demo::files(),
             collapsed: HashSet::new(),
+            visible_branches: demo::BRANCHES
+                .iter()
+                .take(graph::LANE_CAPACITY)
+                .copied()
+                .collect(),
+            hidden_columns: HashSet::new(),
             sidebar_width: SIDEBAR_DEFAULT,
             resize_origin: None,
-            settings_open: false,
+            popover: Popover::None,
             message: "main*  ·  3 changes  ·  2 staged".into(),
         }
     }
@@ -202,7 +252,10 @@ impl Workspace {
     fn select_commit(&mut self, index: usize, cx: &mut Context<Self>) {
         self.commit = index;
         self.file = COMMITS[index].file;
-        self.history_scroll.scroll_to_item(index);
+        // The scroll handle indexes visible rows, not the whole fixture.
+        if let Some(row) = self.graph_rows().iter().position(|row| row.commit == index) {
+            self.history_scroll.scroll_to_item(row);
+        }
         self.message = format!("{}  ·  {}", COMMITS[index].hash, COMMITS[index].subject);
         cx.notify();
     }
@@ -240,6 +293,105 @@ impl Workspace {
     fn open_source(&mut self, path: &'static str, cx: &mut Context<Self>) {
         self.message = format!("{path}  ·  source");
         self.open_tab(Tab::Source { path }, cx);
+    }
+
+    /// Moves the selection `delta` rows through the visible history, wrapping
+    /// at each end. Commits on hidden branches are skipped.
+    fn step_commit(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let rows = self.graph_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = rows
+            .iter()
+            .position(|row| row.commit == self.commit)
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(rows.len() as isize) as usize;
+        self.select_commit(rows[next].commit, cx);
+    }
+
+    fn toggle_popover(&mut self, popover: Popover, cx: &mut Context<Self>) {
+        self.popover = if self.popover == popover {
+            Popover::None
+        } else {
+            popover
+        };
+        cx.notify();
+    }
+
+    /// The columns currently shown, in layout order.
+    fn visible_columns(&self) -> Vec<Column> {
+        COLUMNS
+            .iter()
+            .copied()
+            .filter(|column| !self.hidden_columns.contains(column))
+            .collect()
+    }
+
+    /// Total width of a history row: the graph gutter plus every shown column.
+    fn row_width(&self) -> f32 {
+        graph::GRAPH_WIDTH
+            + self
+                .visible_columns()
+                .iter()
+                .map(|column| column.width())
+                .sum::<f32>()
+    }
+
+    fn toggle_column(&mut self, column: Column, cx: &mut Context<Self>) {
+        if !column.hideable() {
+            return;
+        }
+        if !self.hidden_columns.remove(&column) {
+            self.hidden_columns.insert(column);
+        }
+        self.message = format!(
+            "{} column {}",
+            column.label(),
+            if self.hidden_columns.contains(&column) {
+                "hidden"
+            } else {
+                "shown"
+            }
+        );
+        cx.notify();
+    }
+
+    /// Adds or removes a branch from the graph. The gutter only has room for
+    /// [`graph::LANE_CAPACITY`] lanes, so a full selection refuses to grow.
+    fn toggle_branch(&mut self, branch: &'static str, cx: &mut Context<Self>) {
+        if let Some(index) = self.visible_branches.iter().position(|b| *b == branch) {
+            if self.visible_branches.len() == 1 {
+                self.message = "At least one branch stays visible".into();
+            } else {
+                self.visible_branches.remove(index);
+                self.message = format!("{branch} hidden");
+                // The selection may have just been hidden along with it.
+                let rows = self.graph_rows();
+                if !rows.iter().any(|row| row.commit == self.commit)
+                    && let Some(first) = rows.first()
+                {
+                    self.commit = first.commit;
+                    self.file = COMMITS[first.commit].file;
+                }
+            }
+        } else if self.visible_branches.len() < graph::LANE_CAPACITY {
+            // Keep the fixture's branch order so lanes stay predictable.
+            self.visible_branches.push(branch);
+            self.visible_branches
+                .sort_by_key(|name| demo::BRANCHES.iter().position(|b| b == name));
+            self.message = format!("{branch} shown");
+        } else {
+            self.message = format!(
+                "The graph shows {} branches at a time",
+                graph::LANE_CAPACITY
+            );
+        }
+        cx.notify();
+    }
+
+    fn graph_rows(&self) -> Vec<graph::Row> {
+        graph::rows(&self.visible_branches)
     }
 
     fn toggle_folder(&mut self, path: &'static str, cx: &mut Context<Self>) {
@@ -354,12 +506,15 @@ impl Workspace {
             .child(icon_button(colors, "activity-remote", "◎", false))
             .child(div().flex_1())
             .child(
-                icon_button(colors, "activity-settings", "⚙", self.settings_open).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.settings_open = !this.settings_open;
-                        cx.notify();
-                    }),
-                ),
+                icon_button(
+                    colors,
+                    "activity-settings",
+                    "⚙",
+                    self.popover == Popover::Settings,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_popover(Popover::Settings, cx);
+                })),
             )
     }
 
@@ -386,6 +541,9 @@ impl Workspace {
 
     fn graph_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
+        let columns = self.visible_columns();
+        let row_width = self.row_width();
+        let rows = self.graph_rows();
         column()
             .w(px(width))
             .flex_none()
@@ -401,14 +559,19 @@ impl Workspace {
                     .gap_2()
                     .child(
                         row()
-                            .justify_between()
+                            .gap_2()
                             .child(section_label(colors, "SOURCE CONTROL GRAPH"))
-                            .child(
-                                div()
-                                    .text_color(rgb(colors.muted))
-                                    .text_size(px(16.))
-                                    .child("⋯"),
-                            ),
+                            .child(div().flex_1())
+                            .child(button(colors, "pick-branches", "⑂  Branches").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_popover(Popover::Branches, cx);
+                                }),
+                            ))
+                            .child(button(colors, "pick-columns", "▦  Columns").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_popover(Popover::Columns, cx);
+                                }),
+                            )),
                     )
                     .child(
                         row()
@@ -433,22 +596,20 @@ impl Workspace {
                     .overflow_x_scroll()
                     .child(
                         column()
-                            .w(px(ROW_WIDTH))
+                            .w(px(row_width))
                             .h_full()
                             .min_h_0()
                             .child(
                                 row()
                                     .h(px(28.))
-                                    .w(px(ROW_WIDTH))
+                                    .w(px(row_width))
                                     .flex_none()
                                     .pl(px(graph::GRAPH_WIDTH))
                                     .border_y_1()
                                     .border_color(rgb(colors.line))
-                                    .child(header_cell(colors, COL_HASH, "COMMIT"))
-                                    .child(header_cell(colors, COL_BRANCH, "BRANCH"))
-                                    .child(header_cell(colors, COL_REF, "REF"))
-                                    .child(header_cell(colors, COL_MESSAGE, "MESSAGE"))
-                                    .child(header_cell(colors, COL_TIME, "WHEN")),
+                                    .children(columns.iter().map(|column| {
+                                        header_cell(colors, column.width(), column.label())
+                                    })),
                             )
                             .child(
                                 column()
@@ -458,21 +619,15 @@ impl Workspace {
                                     .min_h_0()
                                     .overflow_y_scroll()
                                     .relative()
-                                    .children(COMMITS.iter().enumerate().map(|(index, commit)| {
-                                        let selected = self.commit == index;
-                                        let ref_color = if commit.reference.contains("origin/") {
-                                            colors.remote
-                                        } else if commit.reference.starts_with('v') {
-                                            colors.tag
-                                        } else if commit.parents.len() > 1 {
-                                            colors.merge
-                                        } else {
-                                            colors.local
-                                        };
+                                    .children(rows.iter().enumerate().map(|(index, graph_row)| {
+                                        let commit = &COMMITS[graph_row.commit];
+                                        let selected = self.commit == graph_row.commit;
+                                        let head = graph_row.commit == demo::HEAD_COMMIT;
+                                        let target = graph_row.commit;
                                         row()
                                             .id(("commit-row", index))
                                             .h(px(graph::ROW_HEIGHT))
-                                            .w(px(ROW_WIDTH))
+                                            .w(px(row_width))
                                             .flex_none()
                                             .pl(px(graph::GRAPH_WIDTH))
                                             .cursor_pointer()
@@ -482,53 +637,60 @@ impl Workspace {
                                                 colors.sidebar
                                             }))
                                             .hover(move |this| this.bg(rgb(colors.hover)))
-                                            .child(
-                                                cell(COL_HASH)
-                                                    .text_size(px(12.))
-                                                    .text_color(rgb(colors.dim))
-                                                    .child(commit.hash),
-                                            )
-                                            .child(cell(COL_BRANCH).child(badge(
-                                                colors,
-                                                commit.branch,
-                                                colors.branch(commit.lane),
-                                            )))
-                                            .child(cell(COL_REF).when(
-                                                !commit.reference.is_empty(),
-                                                |this| {
-                                                    this.child(badge(
-                                                        colors,
-                                                        commit.reference,
-                                                        ref_color,
-                                                    ))
-                                                },
-                                            ))
-                                            .child(
-                                                cell(COL_MESSAGE)
-                                                    .child(
-                                                        div()
-                                                            .min_w_0()
-                                                            .truncate()
-                                                            .child(commit.subject),
-                                                    )
-                                                    .text_size(px(13.))
-                                                    .text_color(rgb(if selected {
-                                                        colors.text_bright
-                                                    } else {
-                                                        colors.text
-                                                    })),
-                                            )
-                                            .child(
-                                                cell(COL_TIME)
-                                                    .text_size(px(11.))
-                                                    .text_color(rgb(colors.dim))
-                                                    .child(commit.time),
-                                            )
+                                            .children(columns.iter().map(|column| {
+                                                let width = column.width();
+                                                match column {
+                                                    Column::Commit => cell(width)
+                                                        .text_size(px(12.))
+                                                        .text_color(rgb(colors.dim))
+                                                        .child(commit.hash),
+                                                    Column::Branch => cell(width)
+                                                        .gap_1()
+                                                        .child(badge(
+                                                            colors,
+                                                            commit.branch,
+                                                            colors.branch(graph_row.lane),
+                                                        ))
+                                                        .when(head, |this| {
+                                                            this.child(badge(
+                                                                colors,
+                                                                "HEAD",
+                                                                colors.text_bright,
+                                                            ))
+                                                        }),
+                                                    Column::Author => cell(width)
+                                                        .text_size(px(12.))
+                                                        .text_color(rgb(colors.muted))
+                                                        .child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .truncate()
+                                                                .child(commit.author),
+                                                        ),
+                                                    Column::Message => cell(width)
+                                                        .text_size(px(13.))
+                                                        .text_color(rgb(if selected {
+                                                            colors.text_bright
+                                                        } else {
+                                                            colors.text
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .truncate()
+                                                                .child(commit.subject),
+                                                        ),
+                                                    Column::When => cell(width)
+                                                        .text_size(px(11.))
+                                                        .text_color(rgb(colors.dim))
+                                                        .child(commit.time),
+                                                }
+                                            }))
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.select_commit(index, cx);
+                                                this.select_commit(target, cx);
                                             }))
                                     }))
-                                    .child(graph::sidebar_graph(colors)),
+                                    .child(graph::sidebar_graph(rows.clone(), colors)),
                             ),
                     ),
             )
@@ -897,7 +1059,7 @@ impl Workspace {
             }))
     }
 
-    fn repository_state(&self) -> impl IntoElement {
+    fn repository_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         let commit = &COMMITS[self.commit];
         column()
@@ -961,6 +1123,50 @@ impl Workspace {
                                     .child("Commit"),
                             )
                             .child(commit.hash),
+                    )
+                    .child(
+                        column()
+                            .mt_2()
+                            .pt_2()
+                            .gap_1()
+                            .border_t_1()
+                            .border_color(rgb(colors.line))
+                            .child(section_label(colors, "REFS"))
+                            .child(div().flex().flex_wrap().gap_1().children(
+                                demo::REFS.iter().enumerate().map(|(index, reference)| {
+                                    let color = match reference.kind {
+                                        demo::RefKind::Local => colors.local,
+                                        demo::RefKind::Remote => colors.remote,
+                                        demo::RefKind::Tag => colors.tag,
+                                    };
+                                    let target = reference.commit;
+                                    div()
+                                        .id(("ref-badge", index))
+                                        .cursor_pointer()
+                                        .hover(|this| this.opacity(0.75))
+                                        .child(badge(colors, reference.name, color))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.select_commit(target, cx);
+                                        }))
+                                }),
+                            ))
+                            .child(div().text_size(px(12.)).text_color(rgb(colors.dim)).child(
+                                format!(
+                                        "{} local · {} remote · {} tags",
+                                        demo::REFS
+                                            .iter()
+                                            .filter(|r| r.kind == demo::RefKind::Local)
+                                            .count(),
+                                        demo::REFS
+                                            .iter()
+                                            .filter(|r| r.kind == demo::RefKind::Remote)
+                                            .count(),
+                                        demo::REFS
+                                            .iter()
+                                            .filter(|r| r.kind == demo::RefKind::Tag)
+                                            .count(),
+                                    ),
+                            )),
                     )
                     .child(
                         column()
@@ -1095,7 +1301,7 @@ impl Workspace {
                             .child("⋯"),
                     ),
             )
-            .child(self.repository_state())
+            .child(self.repository_state(cx))
             .child(div().h(px(1.)).flex_none().bg(rgb(colors.line)))
             .child(
                 column()
@@ -1191,6 +1397,162 @@ impl Workspace {
             )
     }
 
+    /// Shell shared by the column and branch pickers.
+    fn picker(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let colors = self.colors();
+        column()
+            .id(id)
+            .absolute()
+            .left(px(ACTIVITY_WIDTH + 8.))
+            .top(px(78.))
+            .w(px(268.))
+            .p_3()
+            .gap_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(rgb(colors.line_strong))
+            .bg(rgb(colors.elevated))
+            .shadow_lg()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(|_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                row()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(14.))
+                            .text_color(rgb(colors.text_bright))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id("close-picker")
+                            .px_2()
+                            .text_color(rgb(colors.muted))
+                            .cursor_pointer()
+                            .child("\u{00d7}")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.popover = Popover::None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().h(px(1.)).bg(rgb(colors.line)))
+    }
+
+    /// A checkable row inside a picker.
+    fn picker_row(
+        colors: Palette,
+        id: SharedString,
+        label: impl Into<String>,
+        accent: u32,
+        checked: bool,
+        enabled: bool,
+    ) -> Stateful<Div> {
+        row()
+            .id(id)
+            .h(px(28.))
+            .px_2()
+            .gap_2()
+            .rounded(px(4.))
+            .text_size(px(13.))
+            .text_color(rgb(if enabled { colors.text } else { colors.dim }))
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(move |this| this.bg(rgb(colors.hover)))
+            })
+            .child(
+                div()
+                    .w(px(14.))
+                    .flex_none()
+                    .text_color(rgb(if checked { accent } else { colors.dim }))
+                    .child(if checked { "\u{2713}" } else { "\u{00b7}" }),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(label.into()))
+    }
+
+    fn columns_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        self.picker("columns-panel", "Columns", cx)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.dim))
+                    .child("Choose which columns the history shows."),
+            )
+            .children(COLUMNS.iter().map(|&column| {
+                let shown = !self.hidden_columns.contains(&column);
+                Self::picker_row(
+                    colors,
+                    SharedString::from(format!("column-{}", column.label())),
+                    column.label(),
+                    colors.local,
+                    shown,
+                    column.hideable(),
+                )
+                .when(!column.hideable(), |this| {
+                    this.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.dim))
+                            .child("always"),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_column(column, cx);
+                }))
+            }))
+    }
+
+    fn branches_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let shown = self.visible_branches.len();
+        self.picker("branches-panel", "Branches", cx)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.dim))
+                    .child(format!(
+                        "{shown} of {} shown. The graph draws up to {} lanes.",
+                        demo::BRANCHES.len(),
+                        graph::LANE_CAPACITY
+                    )),
+            )
+            .children(demo::BRANCHES.iter().enumerate().map(|(index, &branch)| {
+                let lane = self.visible_branches.iter().position(|b| *b == branch);
+                let full = lane.is_none() && shown >= graph::LANE_CAPACITY;
+                Self::picker_row(
+                    colors,
+                    SharedString::from(format!("branch-{index}")),
+                    branch,
+                    colors.branch(lane.unwrap_or(0)),
+                    lane.is_some(),
+                    !full,
+                )
+                .when(branch == demo::HEAD_BRANCH, |this| {
+                    this.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.local))
+                            .child("HEAD"),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_branch(branch, cx);
+                }))
+            }))
+    }
+
     fn settings_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         column()
@@ -1230,7 +1592,7 @@ impl Workspace {
                             .cursor_pointer()
                             .child("×")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings_open = false;
+                                this.popover = Popover::None;
                                 cx.notify();
                             })),
                     ),
@@ -1343,10 +1705,10 @@ impl Render for Workspace {
             .text_color(rgb(colors.text))
             .text_size(px(14.))
             .on_action(cx.listener(|this, _: &NextCommit, _, cx| {
-                this.select_commit((this.commit + 1) % COMMITS.len(), cx);
+                this.step_commit(1, cx);
             }))
             .on_action(cx.listener(|this, _: &PreviousCommit, _, cx| {
-                this.select_commit((this.commit + COMMITS.len() - 1) % COMMITS.len(), cx);
+                this.step_commit(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowDiff, _, cx| {
                 this.open_tab(Tab::Diff { file: this.file }, cx);
@@ -1368,11 +1730,10 @@ impl Render for Workspace {
                 this.toggle_stage(this.file, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| {
-                this.settings_open = !this.settings_open;
-                cx.notify();
+                this.toggle_popover(Popover::Settings, cx);
             }))
             .on_action(cx.listener(|this, _: &Escape, _, cx| {
-                this.settings_open = false;
+                this.popover = Popover::None;
                 cx.notify();
             }))
             .on_action(|_: &Close, window, _| window.remove_window())
@@ -1414,8 +1775,14 @@ impl Render for Workspace {
                     .child(self.right_sidebar(cx)),
             )
             .child(self.statusbar())
-            .when(self.settings_open, |this| {
+            .when(self.popover == Popover::Settings, |this| {
                 this.child(self.settings_panel(cx))
+            })
+            .when(self.popover == Popover::Columns, |this| {
+                this.child(self.columns_panel(cx))
+            })
+            .when(self.popover == Popover::Branches, |this| {
+                this.child(self.branches_panel(cx))
             })
     }
 }
@@ -1476,6 +1843,10 @@ mod tests {
         ACTIVITY_WIDTH + RESIZER_WIDTH + RIGHT_SIDEBAR_WIDTH
     }
 
+    fn all_columns_width() -> f32 {
+        graph::GRAPH_WIDTH + COLUMNS.iter().map(|c| c.width()).sum::<f32>()
+    }
+
     #[test]
     fn a_roomy_window_keeps_the_dragged_width() {
         assert_eq!(clamp_sidebar_width(SIDEBAR_DEFAULT, 1680.), SIDEBAR_DEFAULT);
@@ -1503,5 +1874,31 @@ mod tests {
     #[test]
     fn a_wide_window_never_stretches_past_the_drag_bound() {
         assert_eq!(clamp_sidebar_width(SIDEBAR_MAX, 4000.), SIDEBAR_MAX);
+    }
+
+    /// The full table is wider than the sidebar can ever be, which is what the
+    /// horizontal scroller exists for.
+    #[test]
+    fn the_full_history_table_is_wider_than_the_sidebar() {
+        assert!(
+            all_columns_width() > SIDEBAR_MAX,
+            "the message column would never need scrolling"
+        );
+    }
+
+    #[test]
+    fn only_the_message_column_is_permanent() {
+        let fixed: Vec<_> = COLUMNS.iter().filter(|c| !c.hideable()).collect();
+        assert_eq!(fixed, vec![&Column::Message]);
+    }
+
+    /// Every column has a distinct label, so the picker is unambiguous.
+    #[test]
+    fn column_labels_are_unique() {
+        let mut labels: Vec<_> = COLUMNS.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        let count = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), count);
     }
 }

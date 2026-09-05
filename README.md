@@ -48,17 +48,28 @@ The local bundle is unsigned and intended for development only.
 
 ## Explore the prototype
 
-- **Repository graph:** select a commit in the left sidebar. Local commits and
-  branches use green, remote-tracking state uses blue, tags use purple, and
-  merge commits use an amber double ring with a hollow center.
-- **Editor:** use the Diff and Source tabs in the center panel. `Cmd+1` and
-  `Cmd+2` switch between them.
-- **Repository sidebar:** select files and stage or unstage them from the right
-  panel. It also shows HEAD/upstream state and the sample source tree.
+- **Repository graph:** each visible branch keeps its own colored rail. Lane
+  changes are drawn as a horizontal connector with small corners, and merge
+  commits use a hollow inner dot so topology reads without relying on color.
+- **History columns:** COMMIT, BRANCH, AUTHOR, MESSAGE, and WHEN are fixed
+  widths so every row lines up, and the table scrolls sideways. **Columns**
+  hides or shows any column except the message.
+- **Branch selection:** the fixture carries eight branches and the graph draws
+  five at a time. **Branches** chooses which. An edge into a hidden parent is
+  redirected to the nearest visible ancestor, so the history stays connected.
+- **Sidebar width:** drag the divider beside the editor. The sidebar opens at
+  full width and yields to the editor when the window cannot hold both.
+- **Editor:** tabs open per file. Selecting a file in the source tree opens it
+  in its own tab, or focuses an existing one. `Cmd+1` and `Cmd+2` move between
+  the diff and a source tab.
+- **Repository sidebar:** stage and unstage files, collapse the source tree,
+  and read the ref list in the repository state. Selecting a ref jumps the
+  history to the commit it points at.
 - **Appearance:** select the gear at the bottom of the activity bar, then choose
   Dark or Light. The choice is kept for the running session.
-- **Shortcuts:** `Up`/`Down` selects commits, `Space` toggles the selected
-  file's staging state, `Cmd+,` opens Settings, and `Escape` closes it.
+- **Shortcuts:** `Up`/`Down` moves through the visible commits, `Space` toggles
+  the selected file's staging state, `Cmd+,` opens Settings, and `Escape`
+  closes any open panel.
 
 Patch snippets and change totals are illustrative fixtures, not computed Git
 output.
@@ -71,14 +82,22 @@ cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warn
 cargo test --locked --manifest-path native/Cargo.toml
 ```
 
+The tests cover lane assignment and branch selection, edge routing geometry,
+and the sidebar width clamp. They need no repository, since the fixture is
+held in memory.
+
 ## Architecture
 
 ```text
 native/src/main.rs    Desktop window, workspace views, in-memory interactions
-native/src/demo.rs    Sample commits, topology, files, and patch snippets
-native/src/graph.rs   Native canvas painting of the sample commit DAG
+native/src/demo.rs    Sample commits, branches, refs, files, and patch snippets
+native/src/graph.rs   Lane assignment, edge routing, and canvas painting
 native/src/theme.rs   Palette and shared visual primitives
 ```
+
+Lanes are not stored on a commit. `graph::rows` derives them from the current
+branch selection, which is what lets the gutter show five of eight branches
+without rewriting the fixture.
 
 The next implementation should introduce repository services behind these
 views, replace fixture indices with stable Git identities, and move graph

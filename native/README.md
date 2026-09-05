@@ -28,30 +28,49 @@ been developed on macOS; Windows and Linux packaging is not yet validated.
 
 ## Explore
 
-- **Repository graph:** select a commit in the left sidebar. Local commits and
-  branches use green, remote-tracking state uses blue, tags use purple, and
-  merge commits use an amber double ring with a hollow center.
-- **Editor:** use the Diff and Source tabs in the center panel. Cmd+1/Ctrl+1 and
-  Cmd+2/Ctrl+2 switch between them.
-- **Repository sidebar:** select files and stage or unstage them from the right
-  panel. It also shows HEAD/upstream state and the sample source tree.
-- **Appearance:** select the gear at the bottom of the activity bar, then choose
-  Dark or Light. The choice is kept for the running preview session.
-- **Shortcuts:** Up/Down selects commits, Space toggles the selected file's
-  staging state, Cmd+,/Ctrl+, opens Settings, and Escape closes it.
+- **Repository graph:** select a commit in the left sidebar. Each visible
+  branch keeps its own colored rail, and lane changes are drawn as a
+  horizontal connector with small corners rather than a long curve. Merge
+  commits use a hollow inner dot so topology reads without relying on color.
+- **History columns:** COMMIT, BRANCH, AUTHOR, MESSAGE, and WHEN are fixed
+  widths, so every row lines up. The table is wider than the sidebar and
+  scrolls sideways. Select **Columns** to hide or show any column except the
+  message.
+- **Branch selection:** the fixture carries eight branches and the gutter
+  draws five at a time. Select **Branches** to choose which. Commits on a
+  hidden branch disappear, and an edge into a hidden parent is redirected to
+  the nearest visible ancestor, so the history never breaks apart.
+- **Sidebar width:** drag the divider between the history and the editor. The
+  sidebar opens at full width and yields to the editor when the window is too
+  narrow to hold both.
+- **Editor:** tabs open per file. Selecting a file in the source tree opens it
+  in its own tab, or focuses the tab if it is already open. Cmd+1/Ctrl+1 and
+  Cmd+2/Ctrl+2 move between the diff and a source tab.
+- **Repository sidebar:** stage or unstage files, expand and collapse the
+  source tree, and read the ref list in the repository state. Selecting a ref
+  jumps the history to the commit it points at.
+- **Appearance:** select the gear at the bottom of the activity bar, then
+  choose Dark or Light. The choice is kept for the running preview session.
+- **Shortcuts:** Up/Down moves through the visible commits, Space toggles the
+  selected file's staging state, Cmd+,/Ctrl+, opens Settings, and Escape
+  closes any open panel.
 
-Commit creation, real Git operations, text editing, search, adjustable pane
-sizes, full accessibility, and persistence are deferred. Patch snippets and
-change totals are illustrative fixtures, not computed Git output.
+Commit creation, real Git operations, text editing, search, and persistence
+are deferred. Patch snippets and change totals are illustrative fixtures, not
+computed Git output.
 
 ## Structure
 
 ```text
 src/main.rs    Desktop window, workspace views, in-memory interactions
-src/demo.rs    Sample commits, topology, files, and patch snippets
-src/graph.rs   Native canvas painting of the sample commit DAG
+src/demo.rs    Sample commits, branches, refs, files, and patch snippets
+src/graph.rs   Lane assignment, edge routing, and canvas painting
 src/theme.rs   Palette and shared visual primitives
 ```
+
+Lanes are not stored on a commit. `graph::rows` derives them from the current
+branch selection, which is what lets the gutter show five of eight branches
+without rewriting the fixture.
 
 The next implementation should introduce repository services behind these
 views, replace fixture indices with stable Git identities, and move graph
@@ -61,5 +80,10 @@ layout out of the fixture data. Keep blocking Git work off the UI thread.
 
 ```sh
 cargo fmt --manifest-path native/Cargo.toml --check
-cargo clippy --locked --manifest-path native/Cargo.toml -- -D warnings
+cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path native/Cargo.toml
 ```
+
+The tests cover lane assignment and the branch selection, edge routing
+geometry, and the sidebar width clamp. They need no repository, since the
+fixture is in memory.
