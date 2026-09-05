@@ -27,8 +27,8 @@ shader compilation avoids requiring full Xcode. Other platforms are unvalidated.
 
 The workspace is arranged around the history. The left sidebar holds the
 graph, then the selected commit with its actions, then the stash. The centre stacks
-the editor above a dock holding the changes on the left, and the staged
-changes above the commit message on the right. The right sidebar holds source control state, refs, and the file
+the editor above a dock holding the changes, the staged changes, and the
+commit message, one above the next. The right sidebar holds source control state, refs, and the file
 tree. Commit actions enable only when Git would accept them, so revert is
 unavailable while the index holds staged work and amend only applies to HEAD.
 

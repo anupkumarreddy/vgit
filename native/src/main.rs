@@ -2011,8 +2011,6 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .border_r_1()
-            .border_color(rgb(colors.line))
             .child(
                 row()
                     .h(px(26.))
@@ -2020,6 +2018,7 @@ impl Workspace {
                     .px_3()
                     .gap_2()
                     .bg(rgb(colors.editor_alt))
+                    .border_t_1()
                     .border_b_1()
                     .border_color(rgb(colors.line))
                     .child(section_label(colors, title))
@@ -2077,10 +2076,10 @@ impl Workspace {
                 .child(glyph)
         };
 
-        row()
-            // Tall enough for the staged list and the commit box stacked
-            // beneath it without either collapsing.
-            .h(px(264.))
+        column()
+            // Three stacked sections; the lists flex and the commit box does
+            // not, so it keeps its full height as the dock is squeezed.
+            .h(px(360.))
             .flex_none()
             .border_t_1()
             .border_color(rgb(colors.line))
@@ -2094,69 +2093,71 @@ impl Workspace {
                     this.stage_all(cx);
                 })),
             ))
+            .child(self.change_column(
+                "dock-staged",
+                format!("STAGED  {staged_count}"),
+                staged_rows,
+                "Nothing is staged.",
+                bulk("unstage-all", "−").on_click(cx.listener(|this, _, _, cx| {
+                    this.unstage_all(cx);
+                })),
+            ))
             .child(
                 column()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(self.change_column(
-                        "dock-staged",
-                        format!("STAGED  {staged_count}"),
-                        staged_rows,
-                        "Nothing is staged.",
-                        bulk("unstage-all", "−").on_click(cx.listener(|this, _, _, cx| {
-                            this.unstage_all(cx);
-                        })),
-                    ))
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(rgb(colors.line))
                     .child(
-                        column()
+                        row()
+                            .h(px(26.))
                             .flex_none()
-                            .border_t_1()
+                            .px_3()
+                            .bg(rgb(colors.editor_alt))
+                            .border_b_1()
                             .border_color(rgb(colors.line))
+                            .child(section_label(colors, "COMMIT MESSAGE")),
+                    )
+                    .child(
+                        row()
+                            .flex_none()
+                            .p_2()
+                            .gap_2()
                             .child(
-                                row()
-                                    .h(px(26.))
-                                    .flex_none()
-                                    .px_3()
-                                    .bg(rgb(colors.editor_alt))
-                                    .border_b_1()
-                                    .border_color(rgb(colors.line))
-                                    .child(section_label(colors, "COMMIT MESSAGE")),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(self.text_field(Field::CommitMessage, cx)),
                             )
                             .child(
-                                column()
+                                row()
+                                    .id("commit-button")
+                                    .h(px(28.))
+                                    .px_3()
                                     .flex_none()
-                                    .p_2()
-                                    .gap_2()
-                                    .child(self.text_field(Field::CommitMessage, cx))
-                                    .child(
-                                        row()
-                                            .id("commit-button")
-                                            .h(px(28.))
-                                            .flex_none()
-                                            .justify_center()
-                                            .rounded(px(4.))
-                                            .bg(rgb(if staged_count == 0 {
-                                                colors.line_strong
-                                            } else {
-                                                colors.local
-                                            }))
-                                            .text_color(rgb(colors.editor))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_size(px(13.))
-                                            .when(staged_count > 0, |this| {
-                                                this.cursor_pointer().on_click(cx.listener(
-                                                    |this, _, _, cx| {
-                                                        this.commit_staged(cx);
-                                                    },
-                                                ))
-                                            })
-                                            .child(if staged_count == 0 {
-                                                "Stage a change to commit".to_string()
-                                            } else {
-                                                format!("Commit {staged_count} change(s)")
-                                            }),
-                                    ),
+                                    .gap_1()
+                                    .justify_center()
+                                    .rounded(px(4.))
+                                    .bg(rgb(if staged_count == 0 {
+                                        colors.line_strong
+                                    } else {
+                                        colors.local
+                                    }))
+                                    .text_color(rgb(colors.editor))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(13.))
+                                    .when(staged_count > 0, |this| {
+                                        this.cursor_pointer().on_click(cx.listener(
+                                            |this, _, _, cx| {
+                                                this.commit_staged(cx);
+                                            },
+                                        ))
+                                    })
+                                    .child("✓")
+                                    .child(if staged_count == 0 {
+                                        "Commit".to_string()
+                                    } else {
+                                        format!("Commit {staged_count}")
+                                    }),
                             ),
                     ),
             )
@@ -2793,6 +2794,7 @@ impl Workspace {
     fn action_button(
         &self,
         id: &'static str,
+        icon: &'static str,
         label: impl Into<String>,
         enabled: bool,
         danger: bool,
@@ -2816,6 +2818,7 @@ impl Workspace {
             .id(id)
             .h(px(26.))
             .px_2()
+            .gap_1()
             .justify_center()
             .flex_none()
             .rounded(px(4.))
@@ -2827,6 +2830,7 @@ impl Workspace {
                 this.cursor_pointer()
                     .hover(move |this| this.bg(rgb(colors.hover)))
             })
+            .child(div().text_size(px(13.)).child(icon))
             .child(label.into())
     }
 
@@ -2892,37 +2896,43 @@ impl Workspace {
                     .flex_wrap()
                     .gap_1()
                     .child(
-                        self.action_button("act-checkout", "Check out", actions.checkout, false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.checkout_selected(cx);
-                            })),
+                        self.action_button(
+                            "act-checkout",
+                            "◎",
+                            "Check out",
+                            actions.checkout,
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.checkout_selected(cx);
+                        })),
                     )
                     .child(
-                        self.action_button("act-revert", "Revert", actions.revert, false)
+                        self.action_button("act-revert", "⟲", "Revert", actions.revert, false)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.revert_selected(cx);
                             })),
                     )
                     .child(
-                        self.action_button("act-soft", "Reset soft", actions.reset, false)
+                        self.action_button("act-soft", "←", "Reset soft", actions.reset, false)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.reset_to_selected(git::ResetMode::Soft, cx);
                             })),
                     )
                     .child(
-                        self.action_button("act-mixed", "Reset mixed", actions.reset, false)
+                        self.action_button("act-mixed", "⇐", "Reset mixed", actions.reset, false)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.reset_to_selected(git::ResetMode::Mixed, cx);
                             })),
                     )
                     .child(
-                        self.action_button("act-hard", "Reset hard", actions.reset, true)
+                        self.action_button("act-hard", "⇤", "Reset hard", actions.reset, true)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.reset_to_selected(git::ResetMode::Hard, cx);
                             })),
                     )
                     .child(
-                        self.action_button("act-amend", "Amend", actions.amend, true)
+                        self.action_button("act-amend", "✎", "Amend", actions.amend, true)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.amend(cx);
                             })),
@@ -2964,7 +2974,7 @@ impl Workspace {
                     .child(section_label(colors, format!("STASH  {}", stashes.len())))
                     .child(div().flex_1())
                     .child(
-                        self.action_button("stash-push", "Stash", dirty, false)
+                        self.action_button("stash-push", "↓", "Stash", dirty, false)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.stash(cx);
                             })),
@@ -3022,7 +3032,7 @@ impl Workspace {
                                     .text_color(rgb(colors.remote))
                                     .cursor_pointer()
                                     .hover(move |this| this.bg(rgb(colors.line_strong)))
-                                    .child("apply")
+                                    .child("↑")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.apply_stash(apply.clone(), cx);
                                     })),
@@ -3036,7 +3046,7 @@ impl Workspace {
                                     .text_color(rgb(colors.dim))
                                     .cursor_pointer()
                                     .hover(move |this| this.text_color(rgb(colors.red)))
-                                    .child("drop")
+                                    .child("×")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.drop_stash(discard.clone(), cx);
                                     })),
