@@ -7,3 +7,4 @@ description = "Native Rust/GPUI visual Git workspace prototype"
 
 [dependencies]
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+unicode-segmentation = "1.12"

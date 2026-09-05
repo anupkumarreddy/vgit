@@ -21,6 +21,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {
+    InvalidState(String),
     /// `start` is not inside a Git working tree.
     NotARepository(PathBuf),
     /// The `git` binary could not be run at all.
@@ -36,6 +37,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::InvalidState(message) => f.write_str(message),
             Error::NotARepository(path) => {
                 write!(f, "{} is not inside a Git repository", path.display())
             }
@@ -135,6 +137,8 @@ pub struct Commit {
     pub relative_time: String,
     /// Ref names pointing at this commit, already stripped of decoration.
     pub refs: Vec<String>,
+    /// Typed refs, joined by object ID (including peeled annotated tags).
+    pub references: Vec<Reference>,
     pub subject: String,
 }
 
@@ -142,6 +146,14 @@ impl Commit {
     pub fn is_merge(&self) -> bool {
         self.parents.len() > 1
     }
+}
+
+/// One entry in the stash list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stash {
+    /// The revision that names it, such as `stash@{0}`.
+    pub reference: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +170,23 @@ pub struct Reference {
     pub kind: RefKind,
     /// The commit the ref resolves to.
     pub target: String,
+}
+
+impl Reference {
+    pub fn full_name(&self) -> String {
+        let prefix = match self.kind {
+            RefKind::Local => "refs/heads/",
+            RefKind::Remote => "refs/remotes/",
+            RefKind::Tag => "refs/tags/",
+        };
+        format!("{prefix}{}", self.name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tracking {
+    pub remote: String,
+    pub merge_ref: String,
 }
 
 /// How far to move the working tree and index when resetting.
@@ -223,6 +252,7 @@ impl Repository {
     /// Runs git and returns stdout, failing if git reports a non-zero status.
     fn run(&self, args: &[&str]) -> Result<String> {
         let output = Command::new("git")
+            .arg("--literal-pathspecs")
             .arg("-C")
             .arg(&self.root)
             .args(args)
@@ -270,7 +300,7 @@ impl Repository {
             return Ok(Vec::new());
         }
         let raw = self.run(&["log", "--all", "--topo-order", &limit, &format])?;
-        Ok(parse_log(&raw))
+        self.decorate(parse_log(&raw))
     }
 
     /// The most recent `limit` commits reachable from `refs`.
@@ -293,7 +323,20 @@ impl Repository {
             args.extend(refs.iter().copied());
             args.push("--");
         }
-        Ok(parse_log(&self.run(&args)?))
+        self.decorate(parse_log(&self.run(&args)?))
+    }
+
+    fn decorate(&self, mut commits: Vec<Commit>) -> Result<Vec<Commit>> {
+        let references = self.references()?;
+        for commit in &mut commits {
+            commit.references = references
+                .iter()
+                .filter(|r| r.target == commit.id)
+                .cloned()
+                .collect();
+            commit.refs = commit.references.iter().map(|r| r.name.clone()).collect();
+        }
+        Ok(commits)
     }
 
     /// Every file tracked in the index, in Git's own sorted order.
@@ -313,7 +356,7 @@ impl Repository {
 
     /// Every local branch, remote-tracking branch, and tag.
     pub fn references(&self) -> Result<Vec<Reference>> {
-        let format = format!("--format=%(refname){FIELD}%(objectname)");
+        let format = format!("--format=%(refname){FIELD}%(objectname){FIELD}%(*objectname)");
         let raw = self.run(&["for-each-ref", &format])?;
         Ok(parse_refs(&raw))
     }
@@ -343,7 +386,31 @@ impl Repository {
 
     /// The unified diff for one path. Pass `staged` to diff the index.
     pub fn diff(&self, path: &str, staged: bool) -> Result<String> {
-        let mut args = vec!["diff", "--no-color"];
+        if !staged
+            && self
+                .status()?
+                .files
+                .iter()
+                .any(|file| file.path == path && file.untracked)
+        {
+            let bytes = std::fs::read(self.root.join(path)).map_err(Error::GitMissing)?;
+            if bytes.contains(&0) {
+                return Ok("Binary file (untracked)\n".into());
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let lines: Vec<_> = text.lines().collect();
+            let mut patch = format!("@@ -0,0 +1,{} @@\n", lines.len());
+            for line in lines {
+                patch.push('+');
+                patch.push_str(line);
+                patch.push('\n');
+            }
+            if !text.is_empty() && !text.ends_with('\n') {
+                patch.push_str("\\ No newline at end of file\n");
+            }
+            return Ok(patch);
+        }
+        let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
         if staged {
             args.push("--staged");
         }
@@ -377,7 +444,11 @@ impl Repository {
         if paths.is_empty() {
             return Ok(());
         }
-        let mut args = vec!["restore", "--staged", "--"];
+        let mut args = if self.head_id()?.is_some() {
+            vec!["restore", "--staged", "--"]
+        } else {
+            vec!["rm", "--cached", "--force", "--"]
+        };
         args.extend_from_slice(paths);
         self.run_unit(&args)
     }
@@ -453,12 +524,21 @@ impl Repository {
         self.run_unit(&["stash", "pop"])
     }
 
-    pub fn stash_list(&self) -> Result<Vec<String>> {
-        Ok(self
-            .run(&["stash", "list", "--pretty=format:%gd %s"])?
-            .lines()
-            .map(str::to_string)
-            .collect())
+    /// Every stash entry, newest first.
+    pub fn stash_list(&self) -> Result<Vec<Stash>> {
+        let format = format!("--pretty=format:%gd{FIELD}%gs");
+        Ok(parse_stashes(&self.run(&["stash", "list", &format])?))
+    }
+
+    /// Restores a stash without removing it from the list.
+    pub fn stash_apply(&self, reference: &str) -> Result<()> {
+        self.run_unit(&["stash", "apply", reference])
+    }
+
+    /// Removes a stash entry. The commit stays reachable through the reflog
+    /// for a while, but nothing in the interface will find it again.
+    pub fn stash_drop(&self, reference: &str) -> Result<()> {
+        self.run_unit(&["stash", "drop", reference])
     }
 
     // ---- Branches ------------------------------------------------------
@@ -505,6 +585,57 @@ impl Repository {
             .filter(|line| !line.is_empty())
             .map(str::to_string)
             .collect())
+    }
+
+    pub fn tracking(&self, branch: &str) -> Result<Option<Tracking>> {
+        let config = |suffix: &str| -> Result<Option<String>> {
+            match self.run(&["config", "--get", &format!("branch.{branch}.{suffix}")]) {
+                Ok(value) => Ok(Some(value.trim().to_string())),
+                Err(Error::Command {
+                    status: Some(1), ..
+                }) => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        match (config("remote")?, config("merge")?) {
+            (Some(remote), Some(merge_ref)) => Ok(Some(Tracking { remote, merge_ref })),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn default_remote(&self) -> Result<String> {
+        let remotes = self.remotes()?;
+        if remotes.iter().any(|r| r == "origin") {
+            return Ok("origin".into());
+        }
+        if remotes.len() == 1 {
+            return Ok(remotes[0].clone());
+        }
+        Err(Error::InvalidState(
+            "Choose an upstream: the repository has no unambiguous default remote".into(),
+        ))
+    }
+
+    pub fn pull_tracking(&self) -> Result<()> {
+        let branch = self
+            .current_branch()?
+            .ok_or_else(|| Error::InvalidState("Detached HEAD has no upstream".into()))?;
+        let tracking = self
+            .tracking(&branch)?
+            .ok_or_else(|| Error::InvalidState("Configure an upstream before pulling".into()))?;
+        self.pull_fast_forward(&tracking.remote, &tracking.merge_ref)
+    }
+
+    pub fn push_tracking(&self) -> Result<()> {
+        let branch = self.current_branch()?.ok_or_else(|| {
+            Error::InvalidState("Detached HEAD cannot be pushed as a branch".into())
+        })?;
+        let tracking = self.tracking(&branch)?;
+        let (remote, target, establish) = match tracking {
+            Some(t) => (t.remote, t.merge_ref, false),
+            None => (self.default_remote()?, format!("refs/heads/{branch}"), true),
+        };
+        self.push(&remote, &format!("refs/heads/{branch}:{target}"), establish)
     }
 
     pub fn fetch(&self, remote: &str, prune: bool) -> Result<()> {
@@ -561,7 +692,7 @@ pub fn parse_status(raw: &str) -> Status {
                 }
             }
             Some('u') => {
-                if let Some(path) = part.split(' ').nth(10) {
+                if let Some(path) = part.splitn(11, ' ').nth(10) {
                     status.files.push(FileStatus {
                         path: path.to_string(),
                         original_path: None,
@@ -668,6 +799,7 @@ fn parse_commit(record: &str) -> Option<Commit> {
         timestamp: fields[5].parse().unwrap_or_default(),
         relative_time: fields[6].to_string(),
         refs: parse_decoration(fields[7]),
+        references: Vec::new(),
         // Anything past the ninth field belonged to the subject.
         subject: fields[8..].join(&FIELD.to_string()),
     })
@@ -689,10 +821,33 @@ fn parse_decoration(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parses `git stash list` written with a field separator.
+pub fn parse_stashes(raw: &str) -> Vec<Stash> {
+    raw.lines()
+        .filter_map(|line| {
+            let (reference, message) = line.split_once(FIELD)?;
+            Some(Stash {
+                reference: reference.trim().to_string(),
+                // Git prefixes the subject with "On <branch>: " or "WIP on ...".
+                message: message
+                    .split_once(": ")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(message)
+                    .trim()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
 pub fn parse_refs(raw: &str) -> Vec<Reference> {
     raw.lines()
         .filter_map(|line| {
-            let (refname, target) = line.split_once(FIELD)?;
+            let mut fields = line.split(FIELD);
+            let refname = fields.next()?;
+            let object = fields.next()?;
+            let peeled = fields.next().unwrap_or("");
+            let target = if peeled.is_empty() { object } else { peeled };
             // Anything outside these three namespaces (refs/stash, notes, and
             // so on) is not a ref the interface shows.
             let (kind, name) = [
@@ -1290,6 +1445,135 @@ mod tests {
     // ---- Failure handling ----------------------------------------------
 
     #[test]
+    fn literal_paths_never_stage_unstage_or_discard_a_matching_neighbor() {
+        let temp = TempRepo::new("literal");
+        temp.write("a[1].txt", "base\n");
+        temp.write("a1.txt", "base\n");
+        temp.git(&["add", "--all"]);
+        temp.git(&["commit", "-m", "base"]);
+        temp.write("a[1].txt", "selected\n");
+        temp.write("a1.txt", "precious\n");
+        let repo = temp.open();
+        repo.stage(&["a[1].txt"]).unwrap();
+        assert_eq!(repo.status().unwrap().staged().count(), 1);
+        repo.stage_all().unwrap();
+        repo.unstage(&["a[1].txt"]).unwrap();
+        assert_eq!(
+            repo.status().unwrap().staged().next().unwrap().path,
+            "a1.txt"
+        );
+        repo.discard(&["a[1].txt"]).unwrap();
+        assert_eq!(temp.read("a[1].txt"), "base\n");
+        assert_eq!(temp.read("a1.txt"), "precious\n");
+    }
+
+    #[test]
+    fn unborn_unstage_preserves_work_even_when_it_differs_from_the_index() {
+        let temp = TempRepo::new("unborn-unstage");
+        temp.write("first.txt", "staged\n");
+        let repo = temp.open();
+        repo.stage(&["first.txt"]).unwrap();
+        temp.write("first.txt", "newer working text\n");
+        repo.unstage(&["first.txt"]).unwrap();
+        assert_eq!(temp.read("first.txt"), "newer working text\n");
+        assert_eq!(repo.status().unwrap().staged().count(), 0);
+        assert!(repo.status().unwrap().files[0].untracked);
+    }
+
+    #[test]
+    fn untracked_diff_shows_additions_and_binary_marker() {
+        let temp = TempRepo::new("untracked-diff");
+        temp.write("new.txt", "one\ntwo");
+        let repo = temp.open();
+        let diff = repo.diff("new.txt", false).unwrap();
+        assert!(diff.contains("+one\n+two\n"));
+        assert!(diff.contains("No newline at end of file"));
+        temp.write("binary", "a\0b");
+        assert!(repo.diff("binary", false).unwrap().contains("Binary"));
+    }
+
+    #[test]
+    fn partial_staging_keeps_index_and_working_diffs_distinct() {
+        let temp = TempRepo::new("partial-stage");
+        temp.commit_file("a.txt", "base\n", "base");
+        temp.write("a.txt", "index\n");
+        let repo = temp.open();
+        repo.stage(&["a.txt"]).unwrap();
+        temp.write("a.txt", "working\n");
+        let status = repo.status().unwrap();
+        assert!(status.files[0].is_staged() && status.files[0].is_modified());
+        assert!(repo.diff("a.txt", true).unwrap().contains("+index"));
+        assert!(repo.diff("a.txt", false).unwrap().contains("+working"));
+        repo.stage(&["a.txt"]).unwrap();
+        assert!(repo.diff("a.txt", false).unwrap().is_empty());
+        repo.unstage(&["a.txt"]).unwrap();
+        assert_eq!(temp.read("a.txt"), "working\n");
+    }
+
+    #[test]
+    fn upstream_destination_can_differ_from_local_branch_name() {
+        let origin = TempRepo::bare("tracking-origin");
+        let temp = TempRepo::new("tracking-local");
+        temp.commit_file("a.txt", "base\n", "base");
+        temp.git(&[
+            "remote",
+            "add",
+            "team/remote",
+            &origin.dir.to_string_lossy(),
+        ]);
+        let repo = temp.open();
+        repo.push("team/remote", "main", false).unwrap();
+        temp.git(&["switch", "-c", "review"]);
+        temp.git(&["config", "branch.review.remote", "team/remote"]);
+        temp.git(&["config", "branch.review.merge", "refs/heads/main"]);
+        temp.commit_file("b.txt", "review\n", "review");
+        repo.push_tracking().unwrap();
+        assert_eq!(
+            origin.git(&["rev-parse", "main"]).trim(),
+            repo.head_id().unwrap().unwrap()
+        );
+        assert!(
+            !origin
+                .git(&["for-each-ref", "refs/heads/review"])
+                .contains("review")
+        );
+        temp.git(&["reset", "--hard", "HEAD~1"]);
+        repo.pull_tracking().unwrap();
+        assert_eq!(temp.read("b.txt"), "review\n");
+    }
+
+    #[test]
+    fn typed_refs_distinguish_slashes_and_peel_annotated_tags() {
+        let temp = TempRepo::new("typed-refs");
+        temp.commit_file("a", "a", "base");
+        temp.git(&["branch", "feature/slash"]);
+        temp.git(&["branch", "v-next"]);
+        temp.git(&["tag", "-a", "release", "-m", "release"]);
+        let commits = temp.open().log(10).unwrap();
+        assert!(
+            commits[0]
+                .references
+                .iter()
+                .any(|r| r.name == "feature/slash" && r.kind == RefKind::Local)
+        );
+        assert!(
+            commits[0]
+                .references
+                .iter()
+                .any(|r| r.name == "release" && r.kind == RefKind::Tag)
+        );
+    }
+
+    #[test]
+    fn unmerged_parser_preserves_the_entire_path() {
+        let status = parse_status(
+            "u UU N... 100644 100644 100644 100644 aaa bbb ccc path with spaces.txt\0",
+        );
+        assert_eq!(status.files[0].path, "path with spaces.txt");
+        assert!(status.files[0].unmerged);
+    }
+
+    #[test]
     fn a_failing_command_reports_git_own_message() {
         let temp = TempRepo::new("failure");
         temp.commit_file("a.txt", "a\n", "Initial commit");
@@ -1416,6 +1700,46 @@ mod tests {
 
         assert!(temp.exists("kept.txt"), "a tracked file must survive");
         assert!(!temp.exists("loose.txt"), "the untracked file is gone");
+    }
+
+    #[test]
+    fn stashes_can_be_listed_applied_and_dropped() {
+        let temp = TempRepo::new("stash-list");
+        temp.commit_file("a.txt", "original\n", "Initial commit");
+        temp.write("a.txt", "first change\n");
+        let repo = temp.open();
+
+        repo.stash_push("first", false).expect("stash");
+        temp.write("a.txt", "second change\n");
+        repo.stash_push("second", false).expect("stash");
+
+        let stashes = repo.stash_list().expect("list");
+        assert_eq!(stashes.len(), 2);
+        assert_eq!(stashes[0].reference, "stash@{0}");
+        assert_eq!(stashes[0].message, "second", "newest first");
+        assert_eq!(stashes[1].message, "first");
+
+        // Applying keeps the entry in the list.
+        repo.stash_apply("stash@{1}").expect("apply");
+        assert_eq!(temp.read("a.txt"), "first change\n");
+        assert_eq!(repo.stash_list().expect("list").len(), 2);
+
+        repo.discard(&["a.txt"]).expect("discard");
+        repo.stash_drop("stash@{1}").expect("drop");
+        let left = repo.stash_list().expect("list");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].message, "second");
+    }
+
+    #[test]
+    fn the_stash_parser_strips_gits_own_prefix() {
+        let raw = format!(
+            "stash@{{0}}{FIELD}On main: tidy up\nstash@{{1}}{FIELD}WIP on main: 1234 subject"
+        );
+        let stashes = parse_stashes(&raw);
+        assert_eq!(stashes[0].message, "tidy up");
+        assert_eq!(stashes[1].message, "1234 subject");
+        assert_eq!(stashes[1].reference, "stash@{1}");
     }
 
     #[test]

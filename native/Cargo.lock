@@ -5874,6 +5874,7 @@ name = "vgit-native"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "unicode-segmentation",
 ]
 
 [[package]]

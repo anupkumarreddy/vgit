@@ -1,121 +1,58 @@
-# VGit native preview
+# VGit native desktop
 
-A visual Git client written entirely in Rust with GPUI.
+A visual Git client written in Rust with GPUI. History, status, refs, diffs,
+and the file tree come from the opened repository. See the root
+[README](../README.md) for controls and the roadmap.
 
-VGit opens the repository it is launched from, or any other through **Open**,
-and shows its real history, diffs, changes, and refs. Every Git operation it
-implements is reachable from the interface.
-
-Anything that can lose work asks first. Hard reset, discard, clean, and amend
-open a confirmation naming exactly what will be lost; nothing destructive
-fires straight from a button.
-
-## Run
-
-From the repository root:
+## Run and package
 
 ```sh
 cargo run --locked --manifest-path native/Cargo.toml
-```
-
-The first build downloads and compiles GPUI dependencies. On macOS, install Rust
-and Xcode Command Line Tools. This prototype enables GPUI's `runtime_shaders`
-feature so the offline Metal compiler from full Xcode is not required.
-
-To produce a local macOS application bundle:
-
-```sh
 ./native/scripts/bundle-macos.sh
 open 'out/VGit Preview.app'
 ```
 
-The local bundle is unsigned and intended for development. The prototype has
-been developed on macOS; Windows and Linux packaging is not yet validated.
+Run from the repository root. The app discovers the repository in its working
+directory; **Open** selects another. The unsigned macOS bundle is for local
+development. Rust and Xcode Command Line Tools are required; runtime Metal
+shader compilation avoids requiring full Xcode. Other platforms are unvalidated.
 
-## Operations
+## Implementation
 
-| Where | What |
-| --- | --- |
-| Title bar | **Open** another repository, **Fetch**, **Pull** (fast-forward only), **Push**, and `⋯` for repository actions |
-| History header | `↻` refresh, **Branches**, **Columns** |
-| Repository panel | **actions** beside the selected commit: check out, revert, reset soft/mixed/hard, amend |
-| Branches picker | choose which branches the graph draws, or **switch** to one |
-| Repository picker | create a branch, stash and restore, delete untracked files |
-| Change rows | `+`/`−` stage and unstage, `⟲` discards that file |
-| Commit box | type a message, then **Commit** |
+- `src/main.rs`: GPUI workspace, background reads, operation guard, and views.
+- `src/git.rs`: Git subprocesses, status/log/ref parsing, and mutations.
+- `src/graph.rs`: topology-derived rails and smooth connectors.
+- `src/input.rs`: text selection, clipboard, Unicode editing, native IME input.
+- `src/theme.rs`: dark/light palettes and shared primitives.
 
-Pull is fast-forward only, so it can never quietly create a merge commit.
-Push sets the upstream when the branch has none.
+The workspace is arranged around the history. The left sidebar holds the
+graph, then the selected commit with its actions, then the stash. The centre
+holds the editor with changes, staged changes, and the commit message docked
+beneath it. The right sidebar holds source control state, refs, and the file
+tree. Commit actions enable only when Git would accept them, so revert is
+unavailable while the index holds staged work and amend only applies to HEAD.
 
-## Explore
+Git receives argument arrays and literal pathspecs. A file named `a[1].txt`
+cannot select its neighbor `a1.txt` during discard or staging. Pull and push
+use the configured upstream destination, even when it differs from the local
+branch name. A new branch uses origin, or the sole remote; ambiguous remotes
+produce an error.
 
-- **History:** every branch keeps its own colored rail. Lanes are derived from
-  the commit graph, not stored on a commit, so the layout follows real
-  topology. Merge commits use a hollow inner dot.
-- **Columns:** COMMIT, BRANCH, AUTHOR, MESSAGE, and WHEN are fixed widths, so
-  every row lines up, and the table scrolls sideways. **Columns** hides or
-  shows any column except the message.
-- **Branches:** the history shows every ref by default. **Branches** narrows it
-  to as many as five, which is what the graph can label clearly.
-- **Changes:** the right sidebar lists what Git reports as changed and staged.
-  The `+` and `−` on a row stage and unstage that path for real, and the
-  header buttons stage or unstage everything.
-- **Committing:** select the message box, type, and select Commit. The message
-  field is a minimal input, so it handles typing and backspace and nothing
-  more.
-- **Diffs:** selecting a change opens `git diff` for that path, with line
-  numbers following the new side of each hunk. Selecting a file under FILES
-  opens its current contents in a tab.
-- **Refresh:** `↻` in the history header re-reads the repository. Every write
-  reloads on its own.
-- **Appearance:** the gear at the bottom of the activity bar chooses Dark or
-  Light for the running session.
-- **Shortcuts:** Up/Down moves through the history, Cmd+1/Ctrl+1 opens the
-  selected change as a diff, Cmd+2/Ctrl+2 focuses a source tab, Cmd+,/Ctrl+,
-  opens Settings, and Escape closes any open panel.
+Only one mutation runs at a time. Additional operations are rejected with a
+status message while it runs. Both success and failure refresh repository
+state, because an unsuccessful revert or stash operation can leave conflicts.
+Read generations reject obsolete completions, and refresh reloads every open
+editor tab. Commit selection follows its object ID across history updates.
 
-## Structure
+Partially staged files appear in both change sections. Each row opens and
+operates on its own index or working-tree version. Untracked text has an
+additions preview; binary files have an explicit marker. Unstaging also works
+before the first commit. Destructive controls require confirmation.
 
-```text
-src/main.rs    Desktop window, workspace views, in-memory interactions
-src/git.rs     Real repository access: commands, parsers, and operations
-src/demo.rs    Sample commits, branches, refs, files, and patch snippets
-src/graph.rs   Lane assignment, edge routing, and canvas painting
-src/theme.rs   Palette and shared visual primitives
-```
-
-## The Git layer
-
-`src/git.rs` runs `git` with an argument array, never a shell string, so no
-path, branch name, or commit message can be read as shell syntax. Every call
-blocks, and the caller runs it off the UI thread; `Workspace::load_repository`
-shows the pattern.
-
-Implemented: repository discovery, status (including renames, conflicts,
-detached HEAD, and ahead/behind), log with parents and refs, ref listing,
-staging and unstaging, commit and amend, revert, reset in all three modes,
-discard, clean, stash, branches, and fetch/pull/push.
-
-Destructive operations are named plainly and kept separate: `reset` with
-`ResetMode::Hard`, `discard`, and `clean` can lose uncommitted work.
-`ResetMode::is_destructive` exists so callers can gate them behind a
-confirmation before any of this reaches a button.
-
-Staging, unstaging, and committing are wired to the interface. Fetch, pull,
-push, branch switching, and the destructive operations are implemented and
-tested but deliberately not reachable from a control yet.
-
-The Git layer is covered by integration tests that build throwaway
-repositories, including fetch and push against a local bare repository, so the
-tests need no network access.
-
-Lanes are not stored on a commit. `graph::rows` derives them from the current
-branch selection, which is what lets the gutter show five of eight branches
-without rewriting the fixture.
-
-The next implementation should introduce repository services behind these
-views, replace fixture indices with stable Git identities, and move graph
-layout out of the fixture data. Keep blocking Git work off the UI thread.
+Input fields support cursor movement, Shift selection, select-all, cut/copy/
+paste, grapheme-aware deletion, and native composition with UTF-16 ranges.
+Messages remain available after cancellation or failure. Theme settings and
+drafts are session-local. There is no file watcher; use refresh for external edits.
 
 ## Checks
 
@@ -125,6 +62,7 @@ cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warn
 cargo test --locked --manifest-path native/Cargo.toml
 ```
 
-The tests cover lane assignment and the branch selection, edge routing
-geometry, and the sidebar width clamp. They need no repository, since the
-fixture is in memory.
+Integration tests create disposable repositories, including local bare remotes.
+They cover path isolation, unborn HEAD, conflicts, staged/working versions,
+tracking destinations, annotated refs, and existing Git operations. Unit tests
+cover graph routing, distinct rails in busy histories, layout, and Unicode input.

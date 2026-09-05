@@ -7,9 +7,9 @@ pub const ROW_HEIGHT: f32 = 28.;
 /// How many branches the branch picker will let you choose at once.
 pub const LANE_CAPACITY: usize = 5;
 
-/// The widest gutter the graph will draw. A busy repository can need more
-/// concurrent rails than this; those are folded onto the last lane rather than
-/// pushing the commit columns off screen.
+/// A useful stress-test size; rendering has no lane cap. The history table
+/// scrolls horizontally so unrelated rails never overlap.
+#[cfg(test)]
 pub const MAX_LANES: usize = 10;
 
 /// Horizontal center of the first lane, and the spacing between lanes.
@@ -27,7 +27,7 @@ const MAX_SEGMENTS: usize = 5;
 
 /// Width of the gutter needed to draw `lanes` rails plus a node radius.
 pub fn gutter_width(lanes: usize) -> f32 {
-    LANE_ORIGIN + (lanes.clamp(1, MAX_LANES) - 1) as f32 * LANE_STEP + 16.
+    LANE_ORIGIN + (lanes.max(1) - 1) as f32 * LANE_STEP + 16.
 }
 
 /// One visible row of history: the commit it shows, the lane it was given, and
@@ -142,7 +142,7 @@ pub fn assign_lanes(commits: &[git::Commit]) -> Graph {
         );
         rows.push(Row {
             commit: index,
-            lane: lane.min(MAX_LANES - 1),
+            lane,
             parents,
             label: labels[lane].clone(),
         });
@@ -150,20 +150,24 @@ pub fn assign_lanes(commits: &[git::Commit]) -> Graph {
 
     Graph {
         rows,
-        lanes: widest.clamp(1, MAX_LANES),
+        lanes: widest.max(1),
     }
 }
 
 /// The branch a commit is a tip of, preferring a local branch over a remote
 /// one. Tags are not branches and never name a rail.
 fn branch_label(commit: &git::Commit) -> Option<String> {
-    let is_tag = |name: &str| name.starts_with('v') && name.contains('.');
     commit
-        .refs
+        .references
         .iter()
-        .find(|name| !name.contains('/') && !is_tag(name))
-        .or_else(|| commit.refs.iter().find(|name| !is_tag(name)))
-        .cloned()
+        .find(|reference| reference.kind == git::RefKind::Local)
+        .or_else(|| {
+            commit
+                .references
+                .iter()
+                .find(|reference| reference.kind == git::RefKind::Remote)
+        })
+        .map(|reference| reference.name.clone())
 }
 
 /// One piece of a routed connector, in canvas-local pixels.
@@ -362,6 +366,18 @@ mod tests {
             timestamp: 0,
             relative_time: "now".into(),
             refs: refs.iter().map(|r| r.to_string()).collect(),
+            references: refs
+                .iter()
+                .map(|name| git::Reference {
+                    name: name.to_string(),
+                    target: id.to_string(),
+                    kind: match *name {
+                        "origin/main" => git::RefKind::Remote,
+                        "v1.2.0" => git::RefKind::Tag,
+                        _ => git::RefKind::Local,
+                    },
+                })
+                .collect(),
             subject: format!("Commit {id}"),
         }
     }
@@ -499,23 +515,27 @@ mod tests {
         assert_eq!(graph.lanes, 1);
     }
 
-    /// A repository busier than the gutter folds onto the last lane rather
-    /// than painting over the commit columns.
+    /// Many simultaneously live branches must retain distinct rails.
     #[test]
-    fn lanes_never_exceed_the_drawable_maximum() {
+    fn busy_history_keeps_all_rails_distinct() {
         let mut commits = Vec::new();
         for index in 0..(MAX_LANES * 3) {
-            commits.push(commit(&format!("tip{index}"), &[], &[]));
+            commits.push(commit(
+                &format!("tip{index}"),
+                &[&format!("base{index}")],
+                &[],
+            ));
         }
         let graph = assign_lanes(&commits);
-        assert!(graph.lanes <= MAX_LANES);
-        assert!(graph.rows.iter().all(|row| row.lane < MAX_LANES));
+        assert_eq!(graph.lanes, MAX_LANES * 3);
+        let lanes: std::collections::HashSet<_> = graph.rows.iter().map(|row| row.lane).collect();
+        assert_eq!(lanes.len(), commits.len());
     }
 
     #[test]
     fn the_gutter_grows_with_the_lanes_it_must_hold() {
         assert!(gutter_width(1) < gutter_width(5));
-        assert_eq!(gutter_width(MAX_LANES), gutter_width(MAX_LANES + 5));
+        assert!(gutter_width(MAX_LANES) < gutter_width(MAX_LANES + 5));
         let widest = lane_x(MAX_LANES - 1) + 6.;
         assert!(widest <= gutter_width(MAX_LANES));
     }

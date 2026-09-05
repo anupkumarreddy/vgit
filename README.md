@@ -51,15 +51,19 @@ The local bundle is unsigned and intended for development only.
 | Where | What |
 | --- | --- |
 | Title bar | **Open** another repository, **Fetch**, **Pull** (fast-forward only), **Push**, and `⋯` for repository actions |
-| History header | `↻` refresh, **Branches**, **Columns** |
-| Repository panel | **actions** beside the selected commit: check out, revert, reset soft/mixed/hard, amend |
-| Branches picker | choose which branches the graph draws, or **switch** to one |
-| Repository picker | create a branch, stash and restore, delete untracked files |
+| Left sidebar, top | The history, with `↻` refresh, **Branches**, and **Columns** |
+| Left sidebar, bottom | The selected commit, its actions, and the stash |
+| Centre, bottom | Changes, staged changes, and the commit message |
+| Right sidebar | Source control state, refs, and the source file tree |
 | Change rows | `+`/`−` stage and unstage, `⟲` discards that file |
-| Commit box | type a message, then **Commit** |
 
-Hard reset, discard, clean, and amend open a confirmation naming what will be
-lost. Pull is fast-forward only, so it can never quietly create a merge
+The commit actions sit under the history: check out, revert, reset soft,
+reset mixed, reset hard, and amend. Each enables only when Git would accept
+it, so revert greys out while the index holds staged work and amend only
+lights up on HEAD.
+
+Hard reset, discard, clean, dropping a stash, and amend open a confirmation
+naming what will be lost. Pull is fast-forward only, so it can never quietly create a merge
 commit. Push sets the upstream when the branch has none.
 
 ## Explore
@@ -77,7 +81,7 @@ commit. Push sets the upstream when the branch has none.
   The `+` and `−` on a row stage and unstage that path; the section headers
   stage or unstage everything.
 - **Committing:** select the message box, type a message, and select Commit.
-  The field is a minimal input that handles typing and backspace.
+  The field supports selection, cursor movement, clipboard, and native text input.
 - **Diffs:** selecting a change opens `git diff` for that path. Selecting a
   file under FILES opens its current contents in its own tab.
 - **Sidebar width:** drag the divider beside the editor. The sidebar opens at
@@ -88,8 +92,8 @@ commit. Push sets the upstream when the branch has none.
   selected change as a diff, `Cmd+2` focuses a source tab, `Cmd+,` opens
   Settings, and `Escape` closes any open panel.
 
-Patch snippets and change totals are illustrative fixtures, not computed Git
-output.
+Diffs and change totals come from Git. Partially staged files have separate
+index and working-tree views; untracked text is previewed as additions.
 
 ## Validation
 
@@ -111,6 +115,7 @@ repository, so no test needs network access.
 native/src/main.rs    Desktop window, workspace views, and repository state
 native/src/git.rs     Repository access: commands, parsers, and operations
 native/src/graph.rs   Lane assignment, edge routing, and canvas painting
+native/src/input.rs   Unicode editing, clipboard, and native composition
 native/src/theme.rs   Palette and shared visual primitives
 ```
 
@@ -119,13 +124,13 @@ and every call blocks and runs on a background thread so the window stays
 responsive. Lanes are derived from the commit graph rather than stored on a
 commit, because a commit does not belong to a branch in Git.
 
-Lanes are not stored on a commit. `graph::rows` derives them from the current
-branch selection, which is what lets the gutter show five of eight branches
-without rewriting the fixture.
-
-The next implementation should introduce repository services behind these
-views, replace fixture indices with stable Git identities, and move graph
-layout out of the fixture data. Blocking Git work must stay off the UI thread.
+Graph rails grow with the history instead of collapsing excess lanes. Ref
+types come from Git namespaces, including peeled annotated tags. Reads carry
+generation identities, so obsolete results cannot overwrite newer state.
+Mutations run one at a time and refresh state even after failure; open tabs
+reload and commit selection follows its object ID. External edits require
+manual refresh. Git paths use literal pathspecs, and pull/push respect configured
+tracking destinations. Input drafts remain available after operations.
 
 VGit does not require an online account for local repository operations. Git
 authentication will be delegated to the user's existing Git credential helpers
@@ -139,7 +144,7 @@ staging, unstaging, and committing work. The fixture has been removed.
 
 Near-term work, in rough order:
 
-1. A real text editor for commit messages, replacing the minimal input
+1. Multiline commit editing and persistent drafts/settings
 2. Progress reporting for long fetches and pushes
 3. Search across commit message, author, hash, branch, and tag
 4. Conflict resolution, line and hunk staging, and interactive rebase
