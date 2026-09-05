@@ -1,5 +1,10 @@
 # VGit
 
+**Native Rust preview:** a separate GPUI prototype with fictional repository
+data is available in [native/](native/README.md). Run
+`cargo run --locked --manifest-path native/Cargo.toml` to explore the new UI.
+The Electron application below remains available.
+
 [![CI](https://github.com/anupkumarreddy/vgit/actions/workflows/ci.yml/badge.svg)](https://github.com/anupkumarreddy/vgit/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/anupkumarreddy/vgit/actions/workflows/codeql.yml/badge.svg)](https://github.com/anupkumarreddy/vgit/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)

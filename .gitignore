@@ -12,6 +12,7 @@ Thumbs.db
 coverage/
 release/
 out/
+native/target/
 *.dmg
 *.AppImage
 *.exe

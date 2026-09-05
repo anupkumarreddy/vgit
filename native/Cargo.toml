@@ -1,0 +1,9 @@
+[package]
+name = "vgit-native"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native Rust/GPUI visual Git workspace prototype"
+
+[dependencies]
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
