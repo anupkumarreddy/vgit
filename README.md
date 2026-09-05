@@ -8,10 +8,11 @@ VGit is an open-source visual desktop Git client written in Rust with
 [GPUI](https://www.gpui.rs/). It presents commits, branches, tags, remotes,
 hashes, authors, and merge paths as an approachable repository map.
 
-> **Status: UI prototype.** The application currently renders a fictional
-> repository held in memory. No Git commands, repository access, or network
-> operations are implemented yet, and restarting resets the demo staging area.
-> The Git layer is the next milestone. See
+> **Status: the interface is a prototype; the Git layer is real.**
+> `native/src/git.rs` runs the installed `git` binary and parses its output,
+> and the **Live repository** panel shows it reading the working directory
+> VGit was launched from. The history graph, diffs, and file lists on screen
+> are still an in-memory fixture. See
 > [Project status and roadmap](#project-status-and-roadmap).
 
 VGit was previously an Electron, React, and TypeScript application. That
@@ -83,17 +84,22 @@ cargo test --locked --manifest-path native/Cargo.toml
 ```
 
 The tests cover lane assignment and branch selection, edge routing geometry,
-and the sidebar width clamp. They need no repository, since the fixture is
-held in memory.
+the sidebar width clamp, and the Git layer. The Git tests build throwaway
+repositories in the temporary directory and remove them afterwards; fetch and
+push run against a local bare repository, so no test needs network access.
 
 ## Architecture
 
 ```text
 native/src/main.rs    Desktop window, workspace views, in-memory interactions
+native/src/git.rs     Real repository access: commands, parsers, and operations
 native/src/demo.rs    Sample commits, branches, refs, files, and patch snippets
 native/src/graph.rs   Lane assignment, edge routing, and canvas painting
 native/src/theme.rs   Palette and shared visual primitives
 ```
+
+Git commands run with argument arrays rather than interpolated shell strings,
+and every call blocks so the caller can run it off the UI thread.
 
 Lanes are not stored on a commit. `graph::rows` derives them from the current
 branch selection, which is what lets the gutter show five of eight branches
@@ -109,16 +115,22 @@ and SSH agent. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Project status and roadmap
 
+Done: the Git layer itself. `native/src/git.rs` implements discovery, status,
+log, refs, staging, commit and amend, revert, reset, discard, clean, stash,
+branches, and fetch/pull/push, covered by integration tests against throwaway
+repositories.
+
 Near-term work, in rough order:
 
-1. Repository services that invoke system Git off the UI thread
-2. Real commit topology, refs, and status replacing the in-memory fixtures
-3. Staging, unstaging, and guarded discard against a real working tree
-4. Commit, amend, branch creation, and switching
-5. Fetch with pruning, fast-forward-only pull, and push with upstream setup
-6. Stash creation and application
-7. Search across commit message, author, hash, branch, and tag
-8. Commit creation UI, text editing, adjustable pane sizes, and persistence
+1. Point the history graph, diffs, and file lists at a real repository,
+   replacing the fixture
+2. Wire the safe write operations: stage, unstage, commit, amend
+3. Wire fetch, fast-forward pull, and push, with progress and error reporting
+4. Wire the destructive operations behind explicit confirmation: hard reset,
+   discard, and clean
+5. Open an arbitrary repository rather than the launch directory
+6. Search across commit message, author, hash, branch, and tag
+7. Text editing, adjustable pane sizes, and persistence
 
 Later work includes interactive rebase, three-way conflict resolution, line and
 hunk staging, reflog recovery, worktrees, submodules, Git LFS,

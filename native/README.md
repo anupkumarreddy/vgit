@@ -1,8 +1,15 @@
 # VGit native preview
 
-A desktop UI prototype written entirely in Rust with GPUI. All repository data
-is fictional and held in memory. No Git commands, repository access, or network
-operations are implemented. Restarting resets the demo staging area.
+A desktop workspace written entirely in Rust with GPUI.
+
+The Git layer in `src/git.rs` is real: it runs the installed `git` binary and
+parses its output. The **Live repository** panel in the right sidebar shows
+that layer reading the working directory VGit was launched from, off the UI
+thread.
+
+Everything else on screen -- the history graph, diffs, file lists, and source
+tree -- is still the in-memory fixture in `src/demo.rs`. Restarting resets the
+demo staging area.
 
 ## Run
 
@@ -63,10 +70,32 @@ computed Git output.
 
 ```text
 src/main.rs    Desktop window, workspace views, in-memory interactions
+src/git.rs     Real repository access: commands, parsers, and operations
 src/demo.rs    Sample commits, branches, refs, files, and patch snippets
 src/graph.rs   Lane assignment, edge routing, and canvas painting
 src/theme.rs   Palette and shared visual primitives
 ```
+
+## The Git layer
+
+`src/git.rs` runs `git` with an argument array, never a shell string, so no
+path, branch name, or commit message can be read as shell syntax. Every call
+blocks, and the caller runs it off the UI thread; `Workspace::load_repository`
+shows the pattern.
+
+Implemented: repository discovery, status (including renames, conflicts,
+detached HEAD, and ahead/behind), log with parents and refs, ref listing,
+staging and unstaging, commit and amend, revert, reset in all three modes,
+discard, clean, stash, branches, and fetch/pull/push.
+
+Destructive operations are named plainly and kept separate: `reset` with
+`ResetMode::Hard`, `discard`, and `clean` can lose uncommitted work.
+`ResetMode::is_destructive` exists so callers can gate them behind a
+confirmation before any of this reaches a button.
+
+None of these operations are wired to the interface yet. They are covered by
+integration tests that build throwaway repositories, including fetch and push
+against a local bare repository, so the tests need no network access.
 
 Lanes are not stored on a commit. `graph::rows` derives them from the current
 branch selection, which is what lets the gutter show five of eight branches

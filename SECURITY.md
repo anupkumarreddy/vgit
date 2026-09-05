@@ -12,6 +12,8 @@ Include the affected version, reproduction steps, expected impact, and any sugge
 
 ## Security design
 
-VGit is a native Rust application. It is currently a UI prototype that does not execute Git, access repositories, or perform network operations; all displayed data is fictional and held in memory.
+VGit is a native Rust application. It executes the installed system Git binary from `native/src/git.rs`, always with an argument array and never through a shell, so no repository path, branch name, or commit message can be interpreted as shell syntax. Git is currently invoked to read the working directory VGit was launched from; the history and diffs shown in the interface are still an in-memory fixture.
 
-As real repository support lands, VGit will execute the installed system Git binary using argument arrays rather than interpolated shell commands, destructive operations will require explicit confirmation, and Git authentication will be delegated to the user's existing credential helpers and SSH agent. Secrets must never be stored in application logs or committed to this repository.
+Git commands block, and callers run them off the UI thread. Git authentication is delegated to the user's existing credential helpers and SSH agent; VGit does not prompt for, store, or transmit credentials.
+
+Operations that can destroy uncommitted work — `reset` with `ResetMode::Hard`, `discard`, and `clean` — are named plainly and are not reachable from the interface. They must be placed behind explicit confirmation before they are wired to any control. Secrets must never be stored in application logs or committed to this repository.

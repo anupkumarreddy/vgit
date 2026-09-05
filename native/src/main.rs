@@ -1,4 +1,5 @@
 mod demo;
+mod git;
 mod graph;
 mod theme;
 
@@ -95,6 +96,23 @@ impl Column {
     }
 }
 
+/// What the Git layer found in the directory VGit was launched from.
+///
+/// This is real repository data, read with the `git` binary off the UI thread.
+/// The history, diffs, and file lists elsewhere in the workspace are still the
+/// in-memory fixture; this is the first surface wired to a real repository.
+enum RepositoryProbe {
+    /// The background read has not finished yet.
+    Loading,
+    Opened {
+        root: String,
+        status: git::Status,
+        commits: usize,
+        references: usize,
+    },
+    Unavailable(String),
+}
+
 /// Which panel, if any, is open over the workspace.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Popover {
@@ -133,6 +151,9 @@ struct Workspace {
     /// Pointer x and sidebar width captured when a resize drag begins.
     resize_origin: Option<(f32, f32)>,
     popover: Popover,
+    repository: RepositoryProbe,
+    /// Held so the background read is not cancelled on drop.
+    repository_task: Option<gpui::Task<()>>,
     message: String,
 }
 
@@ -221,7 +242,7 @@ impl Workspace {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window);
-        Self {
+        let mut workspace = Self {
             focus,
             history_scroll: gpui::ScrollHandle::new(),
             theme: Theme::Dark,
@@ -245,8 +266,50 @@ impl Workspace {
             sidebar_width: SIDEBAR_DEFAULT,
             resize_origin: None,
             popover: Popover::None,
-            message: "main*  ·  3 changes  ·  2 staged".into(),
-        }
+            repository: RepositoryProbe::Loading,
+            repository_task: None,
+            message: "Reading repository…".into(),
+        };
+        workspace.load_repository(cx);
+        workspace
+    }
+
+    /// Reads the repository VGit was launched from, entirely on a background
+    /// thread. Git can block for a long time on a large repository, and the
+    /// window must stay responsive while it does.
+    fn load_repository(&mut self, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| {
+            let probe = cx
+                .background_executor()
+                .spawn(async move {
+                    let cwd = match std::env::current_dir() {
+                        Ok(cwd) => cwd,
+                        Err(error) => return RepositoryProbe::Unavailable(error.to_string()),
+                    };
+                    let repository = match git::Repository::discover(&cwd) {
+                        Ok(repository) => repository,
+                        Err(error) => return RepositoryProbe::Unavailable(error.to_string()),
+                    };
+                    let status = match repository.status() {
+                        Ok(status) => status,
+                        Err(error) => return RepositoryProbe::Unavailable(error.to_string()),
+                    };
+                    RepositoryProbe::Opened {
+                        root: repository.root().display().to_string(),
+                        commits: repository.log(500).map(|log| log.len()).unwrap_or(0),
+                        references: repository.references().map(|refs| refs.len()).unwrap_or(0),
+                        status,
+                    }
+                })
+                .await;
+
+            this.update(cx, |workspace, cx| {
+                workspace.repository = probe;
+                cx.notify();
+            })
+            .ok();
+        });
+        self.repository_task = Some(task);
     }
 
     fn colors(&self) -> Palette {
@@ -1323,6 +1386,8 @@ impl Workspace {
                             .child("⋯"),
                     ),
             )
+            .child(self.live_repository())
+            .child(div().h(px(1.)).flex_none().bg(rgb(colors.line)))
             .child(self.repository_state(cx))
             .child(div().h(px(1.)).flex_none().bg(rgb(colors.line)))
             .child(
@@ -1691,8 +1756,39 @@ impl Workspace {
             )
     }
 
+    /// The status bar reports the real repository VGit was launched from, so
+    /// the counts here are computed by Git rather than read from the fixture.
     fn statusbar(&self) -> impl IntoElement {
         let colors = self.colors();
+        let (branch, ahead_behind, counts) = match &self.repository {
+            RepositoryProbe::Loading => ("⑂ …".to_string(), String::new(), String::new()),
+            RepositoryProbe::Unavailable(_) => {
+                ("⑂ no repository".to_string(), String::new(), String::new())
+            }
+            RepositoryProbe::Opened { status, .. } => {
+                let branch = match (&status.branch, status.detached) {
+                    (Some(name), _) => format!("⑂ {name}"),
+                    (None, true) => "⑂ detached".to_string(),
+                    (None, false) => "⑂ no branch".to_string(),
+                };
+                let ahead_behind = if status.ahead == 0 && status.behind == 0 {
+                    status
+                        .upstream
+                        .as_ref()
+                        .map(|_| "up to date".to_string())
+                        .unwrap_or_default()
+                } else {
+                    format!("↑{} ↓{}", status.ahead, status.behind)
+                };
+                let counts = format!(
+                    "● {}  ✓ {}",
+                    status.changed().count(),
+                    status.staged().count()
+                );
+                (branch, ahead_behind, counts)
+            }
+        };
+
         row()
             .h(px(24.))
             .flex_none()
@@ -1701,15 +1797,117 @@ impl Workspace {
             .bg(rgb(colors.local))
             .text_color(rgb(colors.editor))
             .text_size(px(12.))
-            .child("⑂ main*")
-            .child("↻")
-            .child("ⓧ 0")
-            .child("△ 0")
+            .child(branch)
+            .when(!ahead_behind.is_empty(), |this| this.child(ahead_behind))
+            .when(!counts.is_empty(), |this| this.child(counts))
             .child(div().flex_1().child(self.message.clone()))
             .child("Rust")
             .child("UTF-8")
             .child("LF")
             .child("GPUI")
+    }
+
+    /// A panel showing what the Git layer read from the real repository,
+    /// deliberately separate from the fixture history above it.
+    fn live_repository(&self) -> impl IntoElement {
+        let colors = self.colors();
+        let field = |label: &'static str, value: String, accent: u32| {
+            row()
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .w(px(86.))
+                        .flex_none()
+                        .text_color(rgb(colors.muted))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(rgb(accent))
+                        .child(value),
+                )
+        };
+
+        let body = match &self.repository {
+            RepositoryProbe::Loading => {
+                vec![field("Status", "Reading…".to_string(), colors.muted).into_any_element()]
+            }
+            RepositoryProbe::Unavailable(reason) => vec![
+                field("Status", "Unavailable".to_string(), colors.red).into_any_element(),
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.dim))
+                    .child(reason.clone())
+                    .into_any_element(),
+            ],
+            RepositoryProbe::Opened {
+                root,
+                status,
+                commits,
+                references,
+            } => {
+                let name = root.rsplit('/').next().unwrap_or(root).to_string();
+                vec![
+                    field("Repository", name, colors.text).into_any_element(),
+                    field(
+                        "Branch",
+                        status
+                            .branch
+                            .clone()
+                            .unwrap_or_else(|| "detached".to_string()),
+                        colors.local,
+                    )
+                    .into_any_element(),
+                    field(
+                        "Upstream",
+                        status
+                            .upstream
+                            .clone()
+                            .unwrap_or_else(|| "none".to_string()),
+                        colors.remote,
+                    )
+                    .into_any_element(),
+                    field(
+                        "Ahead",
+                        format!("{} ahead · {} behind", status.ahead, status.behind),
+                        colors.merge,
+                    )
+                    .into_any_element(),
+                    field(
+                        "Changes",
+                        format!(
+                            "{} changed · {} staged",
+                            status.changed().count(),
+                            status.staged().count()
+                        ),
+                        colors.text,
+                    )
+                    .into_any_element(),
+                    field("History", format!("{commits} commits"), colors.text).into_any_element(),
+                    field("Refs", format!("{references} refs"), colors.text).into_any_element(),
+                ]
+            }
+        };
+
+        column()
+            .px_3()
+            .pb_3()
+            .gap_1()
+            .child(
+                row()
+                    .h(px(26.))
+                    .child(section_label(colors, "LIVE REPOSITORY")),
+            )
+            .children(body)
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(colors.dim))
+                    .child("Read from the working directory with git."),
+            )
     }
 }
 
