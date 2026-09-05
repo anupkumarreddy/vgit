@@ -229,7 +229,7 @@ impl Workspace {
     fn graph_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         column()
-            .w(px(326.))
+            .w(px(420.))
             .flex_none()
             .h_full()
             .min_h_0()
@@ -314,35 +314,27 @@ impl Workspace {
                             }))
                             .hover(move |this| this.bg(rgb(colors.hover)))
                             .child(
-                                column()
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(colors.dim))
+                                    .child(commit.hash),
+                            )
+                            .when(!commit.reference.is_empty(), |this| {
+                                this.child(badge(colors, commit.reference, ref_color))
+                            })
+                            .child(
+                                div()
                                     .flex_1()
                                     .min_w_0()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_size(px(11.))
-                                            .text_color(rgb(if selected {
-                                                colors.text_bright
-                                            } else {
-                                                colors.text
-                                            }))
-                                            .child(commit.subject),
-                                    )
-                                    .child(
-                                        row()
-                                            .gap_2()
-                                            .text_size(px(10.))
-                                            .text_color(rgb(colors.dim))
-                                            .child(commit.hash)
-                                            .when(!commit.reference.is_empty(), |this| {
-                                                this.child(badge(
-                                                    colors,
-                                                    commit.reference,
-                                                    ref_color,
-                                                ))
-                                            }),
-                                    ),
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if selected {
+                                        colors.text_bright
+                                    } else {
+                                        colors.text
+                                    }))
+                                    .child(commit.subject),
                             )
                             .child(
                                 div()
@@ -832,7 +824,7 @@ impl Workspace {
             .collect::<Vec<_>>();
         column()
             .id("repository-sidebar")
-            .w(px(294.))
+            .w(px(320.))
             .flex_none()
             .h_full()
             .min_h_0()
