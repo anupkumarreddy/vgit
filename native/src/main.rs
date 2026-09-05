@@ -1,15 +1,16 @@
-mod demo;
 mod git;
 mod graph;
 mod theme;
 
-use demo::{COMMITS, FileChange};
 use gpui::{
-    App, Application, Bounds, Context, Div, FocusHandle, FontWeight, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, SharedString, Stateful, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, div, prelude::*, px, rgb, size,
+    AnyElement, App, Application, Bounds, Context, Div, FocusHandle, FontWeight, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, SharedString, Stateful, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 use theme::{Palette, Theme, badge, column, row, section_label};
 
 actions!(
@@ -27,12 +28,20 @@ actions!(
     ]
 );
 
-/// One open editor tab. Diff tabs follow a changed file; source tabs are
-/// opened from the file tree and stay open until closed.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// One open editor tab. Tabs are keyed by path rather than by index, because
+/// a reload can renumber the change list underneath them.
+#[derive(Clone, PartialEq, Eq)]
 enum Tab {
-    Diff { file: usize },
-    Source { path: &'static str },
+    Diff { path: String, staged: bool },
+    Source { path: String },
+}
+
+impl Tab {
+    fn path(&self) -> &str {
+        match self {
+            Tab::Diff { path, .. } | Tab::Source { path } => path,
+        }
+    }
 }
 
 /// Widths of the fixed chrome around the editor, and the narrowest the editor
@@ -96,24 +105,76 @@ impl Column {
     }
 }
 
-/// What the Git layer found in the directory VGit was launched from.
-///
-/// This is real repository data, read with the `git` binary off the UI thread.
-/// The history, diffs, and file lists elsewhere in the workspace are still the
-/// in-memory fixture; this is the first surface wired to a real repository.
-enum RepositoryProbe {
-    /// The background read has not finished yet.
-    Loading,
-    Opened {
-        root: String,
-        status: git::Status,
-        commits: usize,
-        references: usize,
-    },
-    Unavailable(String),
+/// One row of the source tree, flattened from the tracked file list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TreeRow {
+    depth: usize,
+    name: String,
+    path: String,
+    directory: bool,
 }
 
-/// Which panel, if any, is open over the workspace.
+/// Flattens sorted repository paths into an indented tree.
+fn build_tree(paths: &[String]) -> Vec<TreeRow> {
+    let mut rows: Vec<TreeRow> = Vec::new();
+    let mut open: Vec<&str> = Vec::new();
+
+    for path in paths {
+        let segments: Vec<&str> = path.split('/').collect();
+        let (directories, name) = segments.split_at(segments.len() - 1);
+
+        // Close directories that this path has left, then open the new ones.
+        while open.len() > directories.len() || open[..] != directories[..open.len()] {
+            open.pop();
+        }
+        for (depth, segment) in directories.iter().enumerate().skip(open.len()) {
+            open.push(segment);
+            rows.push(TreeRow {
+                depth,
+                name: (*segment).to_string(),
+                path: segments[..=depth].join("/"),
+                directory: true,
+            });
+        }
+        rows.push(TreeRow {
+            depth: directories.len(),
+            name: name[0].to_string(),
+            path: path.clone(),
+            directory: false,
+        });
+    }
+    rows
+}
+
+/// Everything read from the repository in one background pass.
+#[derive(Clone, Default)]
+struct RepoData {
+    root: PathBuf,
+    status: git::Status,
+    commits: Vec<git::Commit>,
+    graph: graph::Graph,
+    branches: Vec<String>,
+    references: Vec<git::Reference>,
+    tree: Vec<TreeRow>,
+}
+
+/// Where the repository read has got to.
+enum RepoState {
+    Loading,
+    Failed(String),
+    Ready(Box<RepoData>),
+}
+
+impl RepoState {
+    fn data(&self) -> Option<&RepoData> {
+        match self {
+            RepoState::Ready(data) => Some(data),
+            _ => None,
+        }
+    }
+}
+
+/// Which panel, if any, is open over the workspace./// Which panel, if any, is open over the workspace.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Popover {
     None,
@@ -129,8 +190,9 @@ const EDITOR_FONT: &str = "Menlo";
 const EDITOR_FONT_SIZE: f32 = 13.;
 const EDITOR_LINE_HEIGHT: f32 = 20.;
 
-/// The source file opened in the second tab at startup.
-const DEFAULT_SOURCE: &str = "src/ui/workspace.rs";
+/// How much history to read. A repository can hold far more than anyone will
+/// scroll through, and the graph walk is linear in this number.
+const HISTORY_LIMIT: usize = 2000;
 
 struct Workspace {
     focus: FocusHandle,
@@ -138,22 +200,33 @@ struct Workspace {
     theme: Theme,
     tabs: Vec<Tab>,
     active_tab: usize,
+    /// The selected commit, as an index into the loaded history.
     commit: usize,
+    /// The selected path in the change list.
     file: usize,
-    files: Vec<FileChange>,
+    repository: Option<git::Repository>,
+    repo: RepoState,
+    /// Diff text by path and whether the index or the working tree was asked
+    /// for. Filled in on demand, off the UI thread.
+    diffs: HashMap<(String, bool), String>,
+    /// File contents by path, filled in when a source tab opens.
+    sources: HashMap<String, String>,
     /// Directories collapsed in the source tree, by path.
-    collapsed: HashSet<&'static str>,
+    collapsed: HashSet<String>,
     /// Branches drawn in the graph, at most [`graph::LANE_CAPACITY`] of them.
-    visible_branches: Vec<&'static str>,
+    /// Empty means every ref.
+    visible_branches: Vec<String>,
     /// Columns the user has hidden from the history table.
     hidden_columns: HashSet<Column>,
     sidebar_width: f32,
     /// Pointer x and sidebar width captured when a resize drag begins.
     resize_origin: Option<(f32, f32)>,
     popover: Popover,
-    repository: RepositoryProbe,
-    /// Held so the background read is not cancelled on drop.
-    repository_task: Option<gpui::Task<()>>,
+    /// The commit message being typed, and whether keys are going into it.
+    commit_message: String,
+    composing: bool,
+    /// Background reads, held so they are not cancelled on drop.
+    tasks: Vec<gpui::Task<()>>,
     message: String,
 }
 
@@ -177,6 +250,41 @@ fn button(
         .hover(move |this| this.bg(rgb(colors.hover)))
         .active(|this| this.opacity(0.8))
         .child(text.into())
+}
+
+/// The new-side starting line of a unified diff hunk header.
+fn hunk_start(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("@@ ")?;
+    let plus = rest.split(' ').find(|part| part.starts_with('+'))?;
+    plus.trim_start_matches('+').split(',').next()?.parse().ok()
+}
+
+/// Reads everything the workspace shows, in one blocking pass.
+///
+/// Called only from a background thread. `selection` limits the history to
+/// those branches; empty means every ref.
+fn load(
+    repository: &git::Repository,
+    selection: &[String],
+) -> std::result::Result<RepoData, String> {
+    let refs: Vec<&str> = selection.iter().map(String::as_str).collect();
+    let status = repository.status().map_err(|error| error.to_string())?;
+    let commits = repository
+        .log_refs(&refs, HISTORY_LIMIT)
+        .map_err(|error| error.to_string())?;
+    let graph = graph::assign_lanes(&commits);
+
+    Ok(RepoData {
+        root: repository.root().to_path_buf(),
+        status,
+        graph,
+        commits,
+        // A repository can be read even when these fail; an empty list is
+        // better than refusing to show the history.
+        branches: repository.branches().unwrap_or_default(),
+        references: repository.references().unwrap_or_default(),
+        tree: build_tree(&repository.tracked_files().unwrap_or_default()),
+    })
 }
 
 /// Clamps a dragged sidebar width to what `viewport` can spare while leaving
@@ -242,83 +350,179 @@ impl Workspace {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window);
+        let repository = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| git::Repository::discover(cwd).ok());
+
         let mut workspace = Self {
             focus,
             history_scroll: gpui::ScrollHandle::new(),
             theme: Theme::Dark,
-            tabs: vec![
-                Tab::Diff { file: 0 },
-                Tab::Source {
-                    path: DEFAULT_SOURCE,
-                },
-            ],
+            tabs: Vec::new(),
             active_tab: 0,
             commit: 0,
             file: 0,
-            files: demo::files(),
+            repository,
+            repo: RepoState::Loading,
+            diffs: HashMap::new(),
+            sources: HashMap::new(),
             collapsed: HashSet::new(),
-            visible_branches: demo::BRANCHES
-                .iter()
-                .take(graph::LANE_CAPACITY)
-                .copied()
-                .collect(),
+            visible_branches: Vec::new(),
             hidden_columns: HashSet::new(),
             sidebar_width: SIDEBAR_DEFAULT,
             resize_origin: None,
             popover: Popover::None,
-            repository: RepositoryProbe::Loading,
-            repository_task: None,
+            commit_message: String::new(),
+            composing: false,
+            tasks: Vec::new(),
             message: "Reading repository…".into(),
         };
-        workspace.load_repository(cx);
+        workspace.reload(cx);
         workspace
     }
 
-    /// Reads the repository VGit was launched from, entirely on a background
-    /// thread. Git can block for a long time on a large repository, and the
-    /// window must stay responsive while it does.
-    fn load_repository(&mut self, cx: &mut Context<Self>) {
+    /// Reads the repository, entirely on a background thread. Git can block
+    /// for a long time on a large repository, and the window must stay
+    /// responsive while it does.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            self.repo = RepoState::Failed("No Git repository in this directory".into());
+            self.message = "No Git repository in this directory".into();
+            return;
+        };
+        let selection = self.visible_branches.clone();
+
         let task = cx.spawn(async move |this, cx| {
-            let probe = cx
+            let loaded = cx
                 .background_executor()
-                .spawn(async move {
-                    let cwd = match std::env::current_dir() {
-                        Ok(cwd) => cwd,
-                        Err(error) => return RepositoryProbe::Unavailable(error.to_string()),
-                    };
-                    let repository = match git::Repository::discover(&cwd) {
-                        Ok(repository) => repository,
-                        Err(error) => return RepositoryProbe::Unavailable(error.to_string()),
-                    };
-                    let status = match repository.status() {
-                        Ok(status) => status,
-                        Err(error) => return RepositoryProbe::Unavailable(error.to_string()),
-                    };
-                    RepositoryProbe::Opened {
-                        root: repository.root().display().to_string(),
-                        commits: repository.log(500).map(|log| log.len()).unwrap_or(0),
-                        references: repository.references().map(|refs| refs.len()).unwrap_or(0),
-                        status,
-                    }
-                })
+                .spawn(async move { load(&repository, &selection) })
                 .await;
 
             this.update(cx, |workspace, cx| {
-                workspace.repository = probe;
+                match loaded {
+                    Ok(data) => {
+                        workspace.message = format!(
+                            "{} commits · {} changed · {} staged",
+                            data.commits.len(),
+                            data.status.changed().count(),
+                            data.status.staged().count()
+                        );
+                        workspace.commit =
+                            workspace.commit.min(data.commits.len().saturating_sub(1));
+                        workspace.file = workspace
+                            .file
+                            .min(data.status.files.len().saturating_sub(1));
+                        // Cached text can be stale after a write.
+                        workspace.diffs.clear();
+                        workspace.sources.clear();
+                        workspace.repo = RepoState::Ready(Box::new(data));
+                        workspace.ensure_a_tab(cx);
+                    }
+                    Err(error) => {
+                        workspace.message = error.clone();
+                        workspace.repo = RepoState::Failed(error);
+                    }
+                }
                 cx.notify();
             })
             .ok();
         });
-        self.repository_task = Some(task);
+        self.tasks.push(task);
+    }
+
+    /// Runs an operation that changes the repository, then reloads.
+    ///
+    /// The call blocks, so it runs off the UI thread like every other Git
+    /// call, and its own error message is what the user is shown.
+    fn perform(
+        &mut self,
+        description: String,
+        operation: impl FnOnce(&git::Repository) -> git::Result<()> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        self.message = format!("{description}…");
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { operation(&repository) })
+                .await;
+
+            this.update(cx, |workspace, cx| {
+                match outcome {
+                    Ok(()) => {
+                        workspace.message = description;
+                        workspace.reload(cx);
+                    }
+                    Err(error) => workspace.message = error.to_string(),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.tasks.push(task);
+    }
+
+    /// Loads the diff for a path, unless it is already cached.
+    fn request_diff(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
+        let key = (path.clone(), staged);
+        if self.diffs.contains_key(&key) {
+            return;
+        }
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let text = cx
+                .background_executor()
+                .spawn(async move { repository.diff(&path, staged) })
+                .await;
+
+            this.update(cx, |workspace, cx| {
+                workspace.diffs.insert(
+                    key,
+                    text.unwrap_or_else(|error| format!("Could not read the diff: {error}")),
+                );
+                cx.notify();
+            })
+            .ok();
+        });
+        self.tasks.push(task);
+    }
+
+    /// Loads a file's contents, unless they are already cached.
+    fn request_source(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.sources.contains_key(&path) {
+            return;
+        }
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let key = path.clone();
+            let text = cx
+                .background_executor()
+                .spawn(async move { repository.read_working_file(&path) })
+                .await;
+
+            this.update(cx, |workspace, cx| {
+                workspace.sources.insert(
+                    key,
+                    text.unwrap_or_else(|error| format!("Could not read the file: {error}")),
+                );
+                cx.notify();
+            })
+            .ok();
+        });
+        self.tasks.push(task);
     }
 
     fn colors(&self) -> Palette {
         self.theme.palette()
-    }
-
-    /// The open tab, clamped so a stale index can never panic the renderer.
-    fn active_tab(&self) -> Tab {
-        self.tabs[self.active_tab.min(self.tabs.len() - 1)]
     }
 
     /// The sidebar width to actually paint. The stored width is what the user
@@ -330,21 +534,50 @@ impl Workspace {
         clamp_sidebar_width(self.sidebar_width, f32::from(window.viewport_size().width))
     }
 
+    fn data(&self) -> Option<&RepoData> {
+        self.repo.data()
+    }
+
+    fn commits(&self) -> &[git::Commit] {
+        self.data()
+            .map(|data| data.commits.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn changes(&self) -> Vec<git::FileStatus> {
+        self.data()
+            .map(|data| data.status.files.clone())
+            .unwrap_or_default()
+    }
+
+    fn selected_commit(&self) -> Option<&git::Commit> {
+        self.commits().get(self.commit)
+    }
+
     fn select_commit(&mut self, index: usize, cx: &mut Context<Self>) {
         self.commit = index;
-        self.file = COMMITS[index].file;
-        // The scroll handle indexes visible rows, not the whole fixture.
-        if let Some(row) = self.graph_rows().iter().position(|row| row.commit == index) {
-            self.history_scroll.scroll_to_item(row);
+        self.history_scroll.scroll_to_item(index);
+        if let Some(commit) = self.selected_commit() {
+            self.message = format!("{}  ·  {}", commit.short_id, commit.subject);
         }
-        self.message = format!("{}  ·  {}", COMMITS[index].hash, COMMITS[index].subject);
         cx.notify();
     }
 
     fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(file) = self.changes().get(index).cloned() else {
+            return;
+        };
         self.file = index;
-        self.message = format!("{}  ·  working tree", self.files[index].path);
-        self.open_tab(Tab::Diff { file: index }, cx);
+        self.message = format!("{}  ·  working tree", file.path);
+        let staged = file.is_staged() && !file.is_modified();
+        self.open_tab(
+            Tab::Diff {
+                path: file.path.clone(),
+                staged,
+            },
+            cx,
+        );
+        self.request_diff(file.path, staged, cx);
     }
 
     /// Focuses `tab` if it is already open, otherwise appends it.
@@ -360,8 +593,7 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        // Keep one tab open so the editor always has something to show.
-        if self.tabs.len() == 1 {
+        if index >= self.tabs.len() {
             return;
         }
         self.tabs.remove(index);
@@ -369,24 +601,47 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_source(&mut self, path: &'static str, cx: &mut Context<Self>) {
-        self.message = format!("{path}  ·  source");
-        self.open_tab(Tab::Source { path }, cx);
-    }
-
-    /// Moves the selection `delta` rows through the visible history, wrapping
-    /// at each end. Commits on hidden branches are skipped.
-    fn step_commit(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let rows = self.graph_rows();
-        if rows.is_empty() {
+    /// Opens the first change as a diff when nothing is open, so the editor is
+    /// not blank on a freshly loaded repository.
+    fn ensure_a_tab(&mut self, cx: &mut Context<Self>) {
+        if !self.tabs.is_empty() {
             return;
         }
-        let current = rows
-            .iter()
-            .position(|row| row.commit == self.commit)
-            .unwrap_or(0);
-        let next = (current as isize + delta).rem_euclid(rows.len() as isize) as usize;
-        self.select_commit(rows[next].commit, cx);
+        let Some(file) = self.changes().first().cloned() else {
+            return;
+        };
+        let staged = file.is_staged() && !file.is_modified();
+        self.open_tab(
+            Tab::Diff {
+                path: file.path.clone(),
+                staged,
+            },
+            cx,
+        );
+        self.request_diff(file.path, staged, cx);
+    }
+
+    fn open_source(&mut self, path: String, cx: &mut Context<Self>) {
+        self.message = format!("{path}  ·  source");
+        self.open_tab(Tab::Source { path: path.clone() }, cx);
+        self.request_source(path, cx);
+    }
+
+    /// Moves the selection `delta` rows through the history, wrapping at each
+    /// end.
+    fn step_commit(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let total = self.commits().len();
+        if total == 0 {
+            return;
+        }
+        let next = (self.commit as isize + delta).rem_euclid(total as isize) as usize;
+        self.select_commit(next, cx);
+    }
+
+    fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        self.theme = theme;
+        self.message = format!("Appearance changed to {}", theme.label());
+        cx.notify();
     }
 
     fn toggle_popover(&mut self, popover: Popover, cx: &mut Context<Self>) {
@@ -408,8 +663,9 @@ impl Workspace {
     }
 
     /// Total width of a history row: the graph gutter plus every shown column.
-    fn row_width(&self) -> f32 {
-        graph::GRAPH_WIDTH
+    /// Total width of a history row: the graph gutter plus every shown column.
+    fn row_width(&self, gutter: f32) -> f32 {
+        gutter
             + self
                 .visible_columns()
                 .iter()
@@ -438,82 +694,157 @@ impl Workspace {
 
     /// Adds or removes a branch from the graph. The gutter only has room for
     /// [`graph::LANE_CAPACITY`] lanes, so a full selection refuses to grow.
-    fn toggle_branch(&mut self, branch: &'static str, cx: &mut Context<Self>) {
+    /// Adds or removes a branch from the history. An empty selection means
+    /// every ref; the picker refuses to grow past what the graph can label.
+    fn toggle_branch(&mut self, branch: String, cx: &mut Context<Self>) {
         if let Some(index) = self.visible_branches.iter().position(|b| *b == branch) {
-            if self.visible_branches.len() == 1 {
-                self.message = "At least one branch stays visible".into();
-            } else {
-                self.visible_branches.remove(index);
-                self.message = format!("{branch} hidden");
-                // The selection may have just been hidden along with it.
-                let rows = self.graph_rows();
-                if !rows.iter().any(|row| row.commit == self.commit)
-                    && let Some(first) = rows.first()
-                {
-                    self.commit = first.commit;
-                    self.file = COMMITS[first.commit].file;
-                }
-            }
+            self.visible_branches.remove(index);
         } else if self.visible_branches.len() < graph::LANE_CAPACITY {
-            // Keep the fixture's branch order so lanes stay predictable.
             self.visible_branches.push(branch);
-            self.visible_branches
-                .sort_by_key(|name| demo::BRANCHES.iter().position(|b| b == name));
-            self.message = format!("{branch} shown");
         } else {
             self.message = format!(
-                "The graph shows {} branches at a time",
+                "Choose at most {} branches, or none for all",
                 graph::LANE_CAPACITY
             );
+            cx.notify();
+            return;
         }
-        cx.notify();
+        self.commit = 0;
+        self.reload(cx);
     }
 
-    fn graph_rows(&self) -> Vec<graph::Row> {
-        graph::rows(&self.visible_branches)
-    }
-
-    fn toggle_folder(&mut self, path: &'static str, cx: &mut Context<Self>) {
-        if !self.collapsed.remove(path) {
+    fn toggle_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(&path) {
             self.collapsed.insert(path);
         }
         cx.notify();
     }
 
     /// Tree rows that are not inside a collapsed directory.
-    fn visible_tree(&self) -> Vec<&'static demo::TreeEntry> {
+    fn visible_tree(&self) -> Vec<TreeRow> {
+        let Some(data) = self.data() else {
+            return Vec::new();
+        };
         let mut rows = Vec::new();
         let mut hidden_below: Option<usize> = None;
-        for entry in demo::TREE {
+        for entry in &data.tree {
             if let Some(depth) = hidden_below {
                 if entry.depth > depth {
                     continue;
                 }
                 hidden_below = None;
             }
-            rows.push(entry);
-            if entry.directory && self.collapsed.contains(entry.path) {
+            rows.push(entry.clone());
+            if entry.directory && self.collapsed.contains(&entry.path) {
                 hidden_below = Some(entry.depth);
             }
         }
         rows
     }
 
-    fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
-        self.theme = theme;
-        self.message = format!("Appearance changed to {}", theme.label());
-        cx.notify();
+    /// Stages or unstages a path for real, then reloads.
+    fn toggle_stage(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(file) = self.changes().get(index).cloned() else {
+            return;
+        };
+        let path = file.path.clone();
+        let staged = file.is_staged();
+        let description = format!("{} {}", if staged { "Unstaged" } else { "Staged" }, path);
+        self.perform(
+            description,
+            move |repository| {
+                if staged {
+                    repository.unstage(&[&path])
+                } else {
+                    repository.stage(&[&path])
+                }
+            },
+            cx,
+        );
     }
 
-    fn toggle_stage(&mut self, index: usize, cx: &mut Context<Self>) {
-        let file = &mut self.files[index];
-        file.staged = !file.staged;
-        self.message = format!(
-            "{}  ·  {}",
-            file.path,
-            if file.staged { "staged" } else { "unstaged" }
+    /// Commits whatever is staged, using the typed message.
+    fn commit_staged(&mut self, cx: &mut Context<Self>) {
+        let staged = self
+            .data()
+            .map(|data| data.status.staged().count())
+            .unwrap_or(0);
+        if staged == 0 {
+            self.message = "Nothing is staged".into();
+            cx.notify();
+            return;
+        }
+        let message = self.commit_message.trim().to_string();
+        if message.is_empty() {
+            self.composing = true;
+            self.message = "Type a commit message first".into();
+            cx.notify();
+            return;
+        }
+        self.commit_message.clear();
+        self.composing = false;
+        let subject = message.clone();
+        self.perform(
+            format!("Committed: {subject}"),
+            move |repository| repository.commit(&message),
+            cx,
         );
-        cx.notify();
+    }
+
+    /// Handles a keystroke aimed at the commit message field. Returns whether
+    /// the key was consumed, so the caller can stop it reaching the actions.
+    fn type_into_message(&mut self, event: &gpui::KeyDownEvent) -> bool {
+        if !self.composing {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        let commanding = keystroke.modifiers.platform || keystroke.modifiers.control;
+        match keystroke.key.as_str() {
+            "escape" => self.composing = false,
+            "backspace" => {
+                self.commit_message.pop();
+            }
+            "enter" => return !commanding,
+            _ => {
+                if commanding {
+                    return false;
+                }
+                match keystroke.key_char.as_deref() {
+                    // Control characters are not message text.
+                    Some(text) if !text.chars().any(char::is_control) => {
+                        self.commit_message.push_str(text)
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    fn stage_all(&mut self, cx: &mut Context<Self>) {
+        self.perform(
+            "Staged every change".into(),
+            |repository| repository.stage_all(),
+            cx,
+        );
+    }
+
+    fn unstage_all(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<String> = self
+            .data()
+            .map(|data| data.status.staged().map(|f| f.path.clone()).collect())
+            .unwrap_or_default();
+        if paths.is_empty() {
+            return;
+        }
+        self.perform(
+            "Unstaged every change".into(),
+            move |repository| {
+                let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+                repository.unstage(&borrowed)
+            },
+            cx,
+        );
     }
 
     fn titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -621,8 +952,21 @@ impl Workspace {
     fn graph_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         let columns = self.visible_columns();
-        let row_width = self.row_width();
-        let rows = self.graph_rows();
+        let empty = graph::Graph::default();
+        let laid_out = self.data().map(|data| &data.graph).unwrap_or(&empty);
+        let gutter = graph::gutter_width(laid_out.lanes);
+        let row_width = self.row_width(gutter);
+        let commits = self.commits().to_vec();
+        let head = self
+            .data()
+            .and_then(|data| data.status.head.clone())
+            .unwrap_or_default();
+        let selection = if self.visible_branches.is_empty() {
+            "all branches".to_string()
+        } else {
+            format!("{} branches", self.visible_branches.len())
+        };
+
         column()
             .w(px(width))
             .flex_none()
@@ -639,8 +983,13 @@ impl Workspace {
                     .child(
                         row()
                             .gap_2()
-                            .child(section_label(colors, "SOURCE CONTROL GRAPH"))
+                            .child(section_label(colors, "HISTORY"))
                             .child(div().flex_1())
+                            .child(button(colors, "reload", "↻").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.reload(cx);
+                                },
+                            )))
                             .child(button(colors, "pick-branches", "⑂  Branches").on_click(
                                 cx.listener(|this, _, _, cx| {
                                     this.toggle_popover(Popover::Branches, cx);
@@ -663,8 +1012,7 @@ impl Workspace {
                             .bg(rgb(colors.editor))
                             .text_size(px(13.))
                             .text_color(rgb(colors.muted))
-                            .child("⌕")
-                            .child("Filter commits, authors, refs"),
+                            .child(format!("{} commits · {selection}", self.commits().len())),
                     ),
             )
             .child(
@@ -683,7 +1031,7 @@ impl Workspace {
                                     .h(px(28.))
                                     .w(px(row_width))
                                     .flex_none()
-                                    .pl(px(graph::GRAPH_WIDTH))
+                                    .pl(px(gutter))
                                     .border_y_1()
                                     .border_color(rgb(colors.line))
                                     .children(columns.iter().map(|column| {
@@ -698,122 +1046,109 @@ impl Workspace {
                                     .min_h_0()
                                     .overflow_y_scroll()
                                     .relative()
-                                    .children(rows.iter().enumerate().map(|(index, graph_row)| {
-                                        let commit = &COMMITS[graph_row.commit];
-                                        let selected = self.commit == graph_row.commit;
-                                        let head = graph_row.commit == demo::HEAD_COMMIT;
-                                        let target = graph_row.commit;
-                                        row()
-                                            .id(("commit-row", index))
-                                            .h(px(graph::ROW_HEIGHT))
-                                            .w(px(row_width))
-                                            .flex_none()
-                                            .pl(px(graph::GRAPH_WIDTH))
-                                            .cursor_pointer()
-                                            .bg(rgb(if selected {
-                                                colors.selection
-                                            } else {
-                                                colors.sidebar
-                                            }))
-                                            .hover(move |this| this.bg(rgb(colors.hover)))
-                                            .children(columns.iter().map(|column| {
-                                                let width = column.width();
-                                                match column {
-                                                    Column::Commit => cell(width)
-                                                        .text_size(px(12.))
-                                                        .text_color(rgb(colors.dim))
-                                                        .child(commit.hash),
-                                                    Column::Branch => cell(width)
-                                                        .gap_1()
-                                                        .child(badge(
-                                                            colors,
-                                                            commit.branch,
-                                                            colors.branch(graph_row.lane),
-                                                        ))
-                                                        .when(head, |this| {
-                                                            this.child(badge(
-                                                                colors,
-                                                                "HEAD",
-                                                                colors.text_bright,
-                                                            ))
-                                                        }),
-                                                    Column::Author => cell(width)
-                                                        .text_size(px(12.))
-                                                        .text_color(rgb(colors.muted))
-                                                        .child(
-                                                            div()
-                                                                .min_w_0()
-                                                                .truncate()
-                                                                .child(commit.author),
-                                                        ),
-                                                    Column::Message => cell(width)
-                                                        .text_size(px(13.))
-                                                        .text_color(rgb(if selected {
-                                                            colors.text_bright
-                                                        } else {
-                                                            colors.text
-                                                        }))
-                                                        .child(
-                                                            div()
-                                                                .min_w_0()
-                                                                .truncate()
-                                                                .child(commit.subject),
-                                                        ),
-                                                    Column::When => cell(width)
-                                                        .text_size(px(11.))
-                                                        .text_color(rgb(colors.dim))
-                                                        .child(commit.time),
-                                                }
-                                            }))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.select_commit(target, cx);
-                                            }))
-                                    }))
-                                    .child(graph::sidebar_graph(rows.clone(), colors)),
-                            ),
-                    ),
-            )
-            .child(
-                column()
-                    .flex_none()
-                    .border_t_1()
-                    .border_color(rgb(colors.line))
-                    .child(
-                        row()
-                            .h(px(30.))
-                            .px_3()
-                            .gap_2()
-                            .text_size(px(13.))
-                            .text_color(rgb(colors.text))
-                            .child(div().text_color(rgb(colors.local)).child("⑂"))
-                            .child("main")
-                            .child(div().flex_1())
-                            .child(div().text_color(rgb(colors.local)).child("1↑")),
-                    )
-                    .child(
-                        row()
-                            .h(px(28.))
-                            .px_3()
-                            .gap_3()
-                            .text_size(px(12.))
-                            .text_color(rgb(colors.dim))
-                            .child(
-                                row()
-                                    .gap_1()
-                                    .child(div().text_color(rgb(colors.local)).child("●"))
-                                    .child("Local"),
-                            )
-                            .child(
-                                row()
-                                    .gap_1()
-                                    .child(div().text_color(rgb(colors.remote)).child("●"))
-                                    .child("Remote"),
-                            )
-                            .child(
-                                row()
-                                    .gap_1()
-                                    .child(div().text_color(rgb(colors.merge)).child("○"))
-                                    .child("Merge"),
+                                    .children(laid_out.rows.iter().enumerate().map(
+                                        |(index, graph_row)| {
+                                            let commit = &commits[graph_row.commit];
+                                            let selected = self.commit == graph_row.commit;
+                                            let is_head = commit.id == head;
+                                            let target = graph_row.commit;
+                                            let lane_color = colors.branch(graph_row.lane);
+                                            let tags: Vec<&String> = commit
+                                                .refs
+                                                .iter()
+                                                .filter(|name| {
+                                                    Some(*name) != graph_row.label.as_ref()
+                                                })
+                                                .collect();
+                                            row()
+                                                .id(("commit-row", index))
+                                                .h(px(graph::ROW_HEIGHT))
+                                                .w(px(row_width))
+                                                .flex_none()
+                                                .pl(px(gutter))
+                                                .cursor_pointer()
+                                                .bg(rgb(if selected {
+                                                    colors.selection
+                                                } else {
+                                                    colors.sidebar
+                                                }))
+                                                .hover(move |this| this.bg(rgb(colors.hover)))
+                                                .children(columns.iter().map(|column| {
+                                                    let width = column.width();
+                                                    match column {
+                                                        Column::Commit => cell(width)
+                                                            .text_size(px(12.))
+                                                            .font_family(EDITOR_FONT)
+                                                            .text_color(rgb(colors.dim))
+                                                            .child(commit.short_id.clone()),
+                                                        Column::Branch => cell(width)
+                                                            .gap_1()
+                                                            .when_some(
+                                                                graph_row.label.clone(),
+                                                                |this, name| {
+                                                                    this.child(badge(
+                                                                        colors, name, lane_color,
+                                                                    ))
+                                                                },
+                                                            )
+                                                            .when(is_head, |this| {
+                                                                this.child(badge(
+                                                                    colors,
+                                                                    "HEAD",
+                                                                    colors.text_bright,
+                                                                ))
+                                                            })
+                                                            .children(tags.iter().map(|name| {
+                                                                badge(
+                                                                    colors,
+                                                                    (*name).clone(),
+                                                                    colors.tag,
+                                                                )
+                                                            })),
+                                                        Column::Author => cell(width)
+                                                            .text_size(px(12.))
+                                                            .text_color(rgb(colors.muted))
+                                                            .child(
+                                                                div()
+                                                                    .min_w_0()
+                                                                    .truncate()
+                                                                    .child(commit.author.clone()),
+                                                            ),
+                                                        Column::Message => cell(width)
+                                                            .text_size(px(13.))
+                                                            .text_color(rgb(if selected {
+                                                                colors.text_bright
+                                                            } else {
+                                                                colors.text
+                                                            }))
+                                                            .child(
+                                                                div()
+                                                                    .min_w_0()
+                                                                    .truncate()
+                                                                    .child(commit.subject.clone()),
+                                                            ),
+                                                        Column::When => cell(width)
+                                                            .text_size(px(11.))
+                                                            .text_color(rgb(colors.dim))
+                                                            .child(
+                                                                div().min_w_0().truncate().child(
+                                                                    commit
+                                                                        .relative_time
+                                                                        .replace(" ago", ""),
+                                                                ),
+                                                            ),
+                                                    }
+                                                }))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.select_commit(target, cx);
+                                                }))
+                                        },
+                                    ))
+                                    .child(graph::sidebar_graph(
+                                        laid_out.clone(),
+                                        commits.clone(),
+                                        colors,
+                                    )),
                             ),
                     ),
             )
@@ -827,23 +1162,21 @@ impl Workspace {
             .enumerate()
             .map(|(index, tab)| {
                 let active = self.active_tab == index;
-                let (marker, marker_color, title) = match *tab {
-                    Tab::Diff { file } => {
-                        let file = &self.files[file];
-                        (
-                            file.status,
-                            colors.local,
-                            format!(
-                                "{} (Working Tree)",
-                                file.path.rsplit('/').next().unwrap_or("file")
-                            ),
-                        )
-                    }
-                    Tab::Source { path } => (
-                        if path.ends_with(".md") { "MD" } else { "RS" },
-                        colors.remote,
-                        path.rsplit('/').next().unwrap_or(path).to_string(),
-                    ),
+                let (marker, marker_color) = match tab {
+                    Tab::Diff { staged: true, .. } => ("±", colors.local),
+                    Tab::Diff { .. } => ("±", colors.merge),
+                    Tab::Source { .. } => ("◧", colors.remote),
+                };
+                let name = tab
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(tab.path())
+                    .to_string();
+                let title = match tab {
+                    Tab::Diff { staged: true, .. } => format!("{name} (Index)"),
+                    Tab::Diff { .. } => format!("{name} (Working Tree)"),
+                    Tab::Source { .. } => name,
                 };
                 row()
                     .id(("editor-tab", index))
@@ -909,9 +1242,16 @@ impl Workspace {
 
     fn breadcrumb(&self) -> impl IntoElement {
         let colors = self.colors();
-        let path = match self.active_tab() {
-            Tab::Diff { file } => self.files[file].path,
-            Tab::Source { path } => path,
+        let path = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| tab.path().to_string())
+            .unwrap_or_default();
+        let kind = match self.tabs.get(self.active_tab) {
+            Some(Tab::Diff { staged: true, .. }) => "Index",
+            Some(Tab::Diff { .. }) => "Working Tree",
+            Some(Tab::Source { .. }) => "Source",
+            None => "",
         };
         row()
             .h(px(28.))
@@ -931,19 +1271,13 @@ impl Workspace {
                 elements.push(div().child(part.to_string()));
                 elements
             }))
-            .child(div().text_color(rgb(colors.dim)).child("›"))
-            .child(match self.active_tab() {
-                Tab::Diff { .. } => "Working Tree",
-                Tab::Source { .. } => "Source",
+            .when(!kind.is_empty(), |this| {
+                this.child(div().text_color(rgb(colors.dim)).child("›"))
+                    .child(kind)
             })
     }
 
-    fn code_line(
-        &self,
-        line_number: usize,
-        kind: &'static str,
-        code: &'static str,
-    ) -> impl IntoElement {
+    fn code_line(&self, line_number: usize, kind: &'static str, code: String) -> impl IntoElement {
         let colors = self.colors();
         row()
             .h(px(EDITOR_LINE_HEIGHT))
@@ -963,7 +1297,11 @@ impl Workspace {
                     .text_right()
                     .pr_3()
                     .text_color(rgb(colors.code_gutter))
-                    .child(line_number.to_string()),
+                    .child(if line_number == 0 {
+                        String::new()
+                    } else {
+                        line_number.to_string()
+                    }),
             )
             .child(
                 div()
@@ -988,9 +1326,70 @@ impl Workspace {
             )
     }
 
-    fn diff_editor(&self, index: usize) -> impl IntoElement {
+    /// Renders a unified diff produced by `git diff`.
+    fn diff_editor(&self, path: &str, staged: bool) -> AnyElement {
         let colors = self.colors();
-        let file = &self.files[index];
+        let key = (path.to_string(), staged);
+        let Some(text) = self.diffs.get(&key) else {
+            return self.editor_notice("Reading the diff…").into_any_element();
+        };
+        if text.trim().is_empty() {
+            return self
+                .editor_notice("No changes in this file.")
+                .into_any_element();
+        }
+
+        let (mut added, mut removed) = (0usize, 0usize);
+        for line in text.lines() {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                added += 1;
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                removed += 1;
+            }
+        }
+
+        // The header lines carry no information the breadcrumb lacks.
+        let body: Vec<&str> = text
+            .lines()
+            .skip_while(|line| {
+                line.starts_with("diff --git")
+                    || line.starts_with("index ")
+                    || line.starts_with("--- ")
+                    || line.starts_with("+++ ")
+                    || line.starts_with("new file")
+                    || line.starts_with("deleted file")
+                    || line.starts_with("similarity ")
+                    || line.starts_with("rename ")
+                    || line.starts_with("old mode")
+                    || line.starts_with("new mode")
+            })
+            .collect();
+
+        // Line numbers follow the new side of each hunk.
+        let mut number = 0usize;
+        let mut rendered = Vec::new();
+        for line in body {
+            if let Some(start) = hunk_start(line) {
+                number = start;
+                rendered.push(self.hunk_header(line).into_any_element());
+                continue;
+            }
+            let (kind, code) = match line.chars().next() {
+                Some('+') => ("+", &line[1..]),
+                Some('-') => ("-", &line[1..]),
+                Some(' ') => (" ", &line[1..]),
+                _ => (" ", line),
+            };
+            let shown = if kind == "-" { 0 } else { number };
+            if kind != "-" {
+                number += 1;
+            }
+            rendered.push(
+                self.code_line(shown, kind, code.to_string())
+                    .into_any_element(),
+            );
+        }
+
         column()
             .id("diff-editor")
             .flex_1()
@@ -1006,43 +1405,64 @@ impl Workspace {
                     .bg(rgb(colors.editor_alt))
                     .border_b_1()
                     .border_color(rgb(colors.line))
-                    .child(section_label(colors, "WORKING TREE ↔ INDEX"))
+                    .child(section_label(
+                        colors,
+                        if staged {
+                            "HEAD ↔ INDEX"
+                        } else {
+                            "INDEX ↔ WORKING TREE"
+                        },
+                    ))
                     .child(div().flex_1())
                     .child(
                         div()
                             .text_color(rgb(colors.local))
                             .text_size(px(13.))
-                            .child(format!("+{}", file.added)),
+                            .child(format!("+{added}")),
                     )
                     .child(
                         div()
                             .text_color(rgb(colors.red))
                             .text_size(px(13.))
-                            .child(format!("−{}", file.removed)),
+                            .child(format!("−{removed}")),
                     ),
             )
-            .child(
-                div()
-                    .h(px(EDITOR_LINE_HEIGHT + 6.))
-                    .flex_none()
-                    .px_4()
-                    .py_1()
-                    .font_family(EDITOR_FONT)
-                    .text_size(px(EDITOR_FONT_SIZE))
-                    .line_height(px(EDITOR_LINE_HEIGHT))
-                    .text_color(rgb(colors.remote))
-                    .child("@@ -18,10 +18,12 @@ impl Render for Workspace"),
-            )
-            .children(
-                file.patch
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, &(kind, code))| self.code_line(offset + 18, kind, code)),
-            )
+            .children(rendered)
+            .into_any_element()
     }
 
-    fn source_editor(&self, path: &'static str) -> impl IntoElement {
+    fn hunk_header(&self, line: &str) -> impl IntoElement {
         let colors = self.colors();
+        div()
+            .h(px(EDITOR_LINE_HEIGHT + 6.))
+            .flex_none()
+            .px_4()
+            .py_1()
+            .font_family(EDITOR_FONT)
+            .text_size(px(EDITOR_FONT_SIZE))
+            .line_height(px(EDITOR_LINE_HEIGHT))
+            .text_color(rgb(colors.remote))
+            .child(line.to_string())
+    }
+
+    fn editor_notice(&self, text: &'static str) -> impl IntoElement {
+        let colors = self.colors();
+        column()
+            .id("editor-notice")
+            .flex_1()
+            .min_h_0()
+            .p_4()
+            .bg(rgb(colors.editor))
+            .text_size(px(13.))
+            .text_color(rgb(colors.dim))
+            .child(text)
+    }
+
+    fn source_editor(&self, path: &str) -> AnyElement {
+        let colors = self.colors();
+        let Some(text) = self.sources.get(path) else {
+            return self.editor_notice("Reading the file…").into_any_element();
+        };
         column()
             .id("source-editor")
             .flex_1()
@@ -1051,15 +1471,23 @@ impl Workspace {
             .bg(rgb(colors.editor))
             .py_2()
             .children(
-                demo::source(path)
-                    .iter()
+                text.lines()
+                    .take(4000)
                     .enumerate()
-                    .map(|(offset, code)| self.code_line(offset + 1, " ", code)),
+                    .map(|(offset, code)| self.code_line(offset + 1, " ", code.to_string())),
             )
+            .into_any_element()
     }
 
     fn editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
+        let body = match self.tabs.get(self.active_tab) {
+            Some(Tab::Diff { path, staged }) => self.diff_editor(path, *staged),
+            Some(Tab::Source { path }) => self.source_editor(path),
+            None => self
+                .editor_notice("Select a change or a file to open it here.")
+                .into_any_element(),
+        };
         column()
             .flex_1()
             .min_w_0()
@@ -1067,24 +1495,57 @@ impl Workspace {
             .bg(rgb(colors.editor))
             .child(self.editor_tabs(cx))
             .child(self.breadcrumb())
-            .child(match self.active_tab() {
-                Tab::Diff { file } => self.diff_editor(file).into_any_element(),
-                Tab::Source { path } => self.source_editor(path).into_any_element(),
-            })
+            .child(body)
     }
 
-    fn file_row(&self, index: usize, staged: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn file_row(
+        &self,
+        index: usize,
+        file: &git::FileStatus,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let colors = self.colors();
-        let file = &self.files[index];
+        let staged = file.is_staged();
+        // The letter Git itself uses, taken from whichever side changed.
+        let letter = if file.untracked {
+            "?"
+        } else if file.unmerged {
+            "!"
+        } else if staged {
+            match file.index {
+                'A' => "A",
+                'D' => "D",
+                'R' => "R",
+                _ => "M",
+            }
+        } else {
+            match file.worktree {
+                'D' => "D",
+                'A' => "A",
+                _ => "M",
+            }
+        };
+        let color = match letter {
+            "A" => colors.local,
+            "D" => colors.red,
+            "?" => colors.dim,
+            "!" => colors.merge,
+            _ => colors.remote,
+        };
+        let name = file
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&file.path)
+            .to_string();
+        let directory = file
+            .path
+            .rsplit_once('/')
+            .map(|(head, _)| head.to_string())
+            .unwrap_or_default();
+
         row()
-            .id((
-                if staged {
-                    "staged-file"
-                } else {
-                    "changed-file"
-                },
-                index,
-            ))
+            .id(("change-row", index))
             .h(px(28.))
             .px_2()
             .gap_2()
@@ -1100,12 +1561,8 @@ impl Workspace {
                     .w(px(13.))
                     .flex_none()
                     .text_size(px(12.))
-                    .text_color(rgb(if file.status == "M" {
-                        colors.remote
-                    } else {
-                        colors.local
-                    }))
-                    .child(file.status),
+                    .text_color(rgb(color))
+                    .child(letter),
             )
             .child(
                 div()
@@ -1114,15 +1571,13 @@ impl Workspace {
                     .truncate()
                     .text_size(px(13.))
                     .text_color(rgb(colors.text))
-                    .child(file.path.rsplit('/').next().unwrap_or(file.path)),
+                    .child(name),
             )
             .child(
-                div().text_size(px(11.)).text_color(rgb(colors.dim)).child(
-                    file.path
-                        .rsplit_once('/')
-                        .map(|value| value.0)
-                        .unwrap_or(""),
-                ),
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(colors.dim))
+                    .child(directory),
             )
             .child(
                 div()
@@ -1144,116 +1599,155 @@ impl Workspace {
             }))
     }
 
+    /// Real repository state: the branch, its upstream, and the refs Git
+    /// reports, all read from the repository rather than from a fixture.
     fn repository_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
-        let commit = &COMMITS[self.commit];
-        column()
-            .child(
-                row()
-                    .h(px(26.))
-                    .px_3()
-                    .justify_between()
-                    .child(section_label(colors, "REPOSITORY STATE"))
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .text_color(rgb(colors.dim))
-                            .child("⌃"),
-                    ),
-            )
-            .child(
-                column()
-                    .px_3()
-                    .pb_3()
-                    .gap_2()
-                    .child(
-                        row()
-                            .text_size(px(13.))
-                            .child(div().w(px(86.)).text_color(rgb(colors.muted)).child("HEAD"))
-                            .child(div().text_color(rgb(colors.local)).child("main")),
+        let field = |label: &'static str, value: String, accent: u32| {
+            row()
+                .text_size(px(13.))
+                .child(
+                    div()
+                        .w(px(86.))
+                        .flex_none()
+                        .text_color(rgb(colors.muted))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(rgb(accent))
+                        .child(value),
+                )
+        };
+
+        let mut body: Vec<gpui::AnyElement> = Vec::new();
+        match &self.repo {
+            RepoState::Loading => {
+                body.push(field("Status", "Reading…".into(), colors.muted).into_any_element())
+            }
+            RepoState::Failed(reason) => {
+                body.push(field("Status", "Unavailable".into(), colors.red).into_any_element());
+                body.push(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(colors.dim))
+                        .child(reason.clone())
+                        .into_any_element(),
+                );
+            }
+            RepoState::Ready(data) => {
+                let name = data
+                    .root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| data.root.display().to_string());
+                body.push(field("Repository", name, colors.text).into_any_element());
+                body.push(
+                    field(
+                        "HEAD",
+                        match (&data.status.branch, data.status.detached) {
+                            (Some(branch), _) => branch.clone(),
+                            (None, true) => "detached".into(),
+                            (None, false) => "unborn".into(),
+                        },
+                        colors.local,
                     )
-                    .child(
-                        row()
-                            .text_size(px(13.))
-                            .child(
-                                div()
-                                    .w(px(86.))
-                                    .text_color(rgb(colors.muted))
-                                    .child("Upstream"),
-                            )
-                            .child(div().text_color(rgb(colors.remote)).child("origin/main")),
+                    .into_any_element(),
+                );
+                body.push(
+                    field(
+                        "Upstream",
+                        data.status
+                            .upstream
+                            .clone()
+                            .unwrap_or_else(|| "none".into()),
+                        colors.remote,
                     )
-                    .child(
-                        row()
-                            .text_size(px(13.))
-                            .child(
-                                div()
-                                    .w(px(86.))
-                                    .text_color(rgb(colors.muted))
-                                    .child("Status"),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(colors.merge))
-                                    .child("1 ahead · 0 behind"),
-                            ),
+                    .into_any_element(),
+                );
+                body.push(
+                    field(
+                        "Status",
+                        format!(
+                            "{} ahead · {} behind",
+                            data.status.ahead, data.status.behind
+                        ),
+                        colors.merge,
                     )
-                    .child(
-                        row()
-                            .text_size(px(13.))
-                            .child(
-                                div()
-                                    .w(px(86.))
-                                    .text_color(rgb(colors.muted))
-                                    .child("Commit"),
-                            )
-                            .child(commit.hash),
-                    )
-                    .child(
-                        column()
-                            .mt_2()
-                            .pt_2()
-                            .gap_1()
-                            .border_t_1()
-                            .border_color(rgb(colors.line))
-                            .child(section_label(colors, "REFS"))
-                            .child(div().flex().flex_wrap().gap_1().children(
-                                demo::REFS.iter().enumerate().map(|(index, reference)| {
+                    .into_any_element(),
+                );
+                if let Some(commit) = self.selected_commit() {
+                    body.push(
+                        field("Commit", commit.short_id.clone(), colors.text).into_any_element(),
+                    );
+                }
+
+                let locals = data
+                    .references
+                    .iter()
+                    .filter(|r| r.kind == git::RefKind::Local)
+                    .count();
+                let remotes = data
+                    .references
+                    .iter()
+                    .filter(|r| r.kind == git::RefKind::Remote)
+                    .count();
+                let tags = data
+                    .references
+                    .iter()
+                    .filter(|r| r.kind == git::RefKind::Tag)
+                    .count();
+
+                body.push(
+                    column()
+                        .mt_2()
+                        .pt_2()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(rgb(colors.line))
+                        .child(section_label(colors, "REFS"))
+                        .child(div().flex().flex_wrap().gap_1().children(
+                            data.references.iter().take(40).enumerate().map(
+                                |(index, reference)| {
                                     let color = match reference.kind {
-                                        demo::RefKind::Local => colors.local,
-                                        demo::RefKind::Remote => colors.remote,
-                                        demo::RefKind::Tag => colors.tag,
+                                        git::RefKind::Local => colors.local,
+                                        git::RefKind::Remote => colors.remote,
+                                        git::RefKind::Tag => colors.tag,
                                     };
-                                    let target = reference.commit;
+                                    let target = reference.target.clone();
                                     div()
                                         .id(("ref-badge", index))
                                         .cursor_pointer()
                                         .hover(|this| this.opacity(0.75))
-                                        .child(badge(colors, reference.name, color))
+                                        .child(badge(colors, reference.name.clone(), color))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.select_commit(target, cx);
+                                            if let Some(row) =
+                                                this.commits().iter().position(|c| c.id == target)
+                                            {
+                                                this.select_commit(row, cx);
+                                            } else {
+                                                this.message =
+                                                    "That ref is outside the loaded history".into();
+                                                cx.notify();
+                                            }
                                         }))
-                                }),
-                            ))
-                            .child(div().text_size(px(12.)).text_color(rgb(colors.dim)).child(
-                                format!(
-                                        "{} local · {} remote · {} tags",
-                                        demo::REFS
-                                            .iter()
-                                            .filter(|r| r.kind == demo::RefKind::Local)
-                                            .count(),
-                                        demo::REFS
-                                            .iter()
-                                            .filter(|r| r.kind == demo::RefKind::Remote)
-                                            .count(),
-                                        demo::REFS
-                                            .iter()
-                                            .filter(|r| r.kind == demo::RefKind::Tag)
-                                            .count(),
-                                    ),
-                            )),
-                    )
-                    .child(
+                                },
+                            ),
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(colors.dim))
+                                .child(format!("{locals} local · {remotes} remote · {tags} tags")),
+                        )
+                        .into_any_element(),
+                );
+
+                if let Some(commit) = self.selected_commit() {
+                    body.push(
                         column()
                             .mt_2()
                             .pt_2()
@@ -1265,55 +1759,67 @@ impl Workspace {
                                 div()
                                     .text_size(px(13.))
                                     .text_color(rgb(colors.text))
-                                    .child(commit.subject),
+                                    .child(commit.subject.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(colors.dim))
-                                    .child(format!("{} · {}", commit.author, commit.description)),
-                            ),
-                    ),
+                            .child(div().text_size(px(12.)).text_color(rgb(colors.dim)).child(
+                                format!(
+                                    "{} · {} · {}",
+                                    commit.short_id, commit.author, commit.relative_time
+                                ),
+                            ))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+
+        column()
+            .flex_none()
+            .child(
+                row()
+                    .h(px(26.))
+                    .px_3()
+                    .child(section_label(colors, "REPOSITORY")),
             )
+            .child(column().px_3().pb_3().gap_1().children(body))
     }
 
     fn right_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
-        let staged_count = self.files.iter().filter(|file| file.staged).count();
-        let changed_count = self.files.len() - staged_count;
-        let changed_rows = self
-            .files
+        let files = self.changes();
+        let staged_count = files.iter().filter(|file| file.is_staged()).count();
+        let changed_count = files.iter().filter(|file| file.is_modified()).count();
+        let changed_rows = files
             .iter()
             .enumerate()
-            .filter(|(_, file)| !file.staged)
-            .map(|(index, _)| self.file_row(index, false, cx).into_any_element())
+            .filter(|(_, file)| file.is_modified())
+            .map(|(index, file)| self.file_row(index, file, cx).into_any_element())
             .collect::<Vec<_>>();
-        let staged_rows = self
-            .files
+        let staged_rows = files
             .iter()
             .enumerate()
-            .filter(|(_, file)| file.staged)
-            .map(|(index, _)| self.file_row(index, true, cx).into_any_element())
+            .filter(|(_, file)| file.is_staged())
+            .map(|(index, file)| self.file_row(index, file, cx).into_any_element())
             .collect::<Vec<_>>();
-        let open_source = match self.active_tab() {
-            Tab::Source { path } => Some(path),
-            Tab::Diff { .. } => None,
+
+        let open_source = match self.tabs.get(self.active_tab) {
+            Some(Tab::Source { path }) => Some(path.clone()),
+            _ => None,
         };
         let tree_rows = self
             .visible_tree()
             .into_iter()
             .enumerate()
             .map(|(index, entry)| {
-                let collapsed = self.collapsed.contains(entry.path);
-                let selected = open_source == Some(entry.path);
+                let collapsed = self.collapsed.contains(&entry.path);
+                let selected = open_source.as_deref() == Some(entry.path.as_str());
                 let (glyph, glyph_color) = if entry.directory {
                     (if collapsed { "›" } else { "⌄" }, colors.muted)
-                } else if entry.path.ends_with(".md") {
-                    ("#", colors.muted)
                 } else {
-                    ("RS", colors.remote)
+                    ("·", colors.dim)
                 };
-                let path = entry.path;
+                let path = entry.path.clone();
+                let directory = entry.directory;
                 row()
                     .id(("tree-row", index))
                     .h(px(26.))
@@ -1349,18 +1855,19 @@ impl Workspace {
                             } else {
                                 colors.muted
                             }))
-                            .child(entry.name),
+                            .child(entry.name.clone()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if entry.directory {
-                            this.toggle_folder(path, cx);
+                        if directory {
+                            this.toggle_folder(path.clone(), cx);
                         } else {
-                            this.open_source(path, cx);
+                            this.open_source(path.clone(), cx);
                         }
                     }))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
+
         column()
             .id("repository-sidebar")
             .w(px(RIGHT_SIDEBAR_WIDTH))
@@ -1378,16 +1885,8 @@ impl Workspace {
                     .justify_between()
                     .border_b_1()
                     .border_color(rgb(colors.line))
-                    .child(section_label(colors, "SOURCE CONTROL"))
-                    .child(
-                        div()
-                            .text_size(px(16.))
-                            .text_color(rgb(colors.muted))
-                            .child("⋯"),
-                    ),
+                    .child(section_label(colors, "SOURCE CONTROL")),
             )
-            .child(self.live_repository())
-            .child(div().h(px(1.)).flex_none().bg(rgb(colors.line)))
             .child(self.repository_state(cx))
             .child(div().h(px(1.)).flex_none().bg(rgb(colors.line)))
             .child(
@@ -1402,14 +1901,20 @@ impl Workspace {
                             .flex_none()
                             .px_3()
                             .gap_2()
-                            .child(div().text_color(rgb(colors.muted)).child("⌄"))
                             .child(section_label(colors, format!("CHANGES  {changed_count}")))
                             .child(div().flex_1())
                             .child(
                                 div()
-                                    .text_size(px(17.))
+                                    .id("stage-all")
+                                    .px_1()
+                                    .text_size(px(15.))
                                     .text_color(rgb(colors.muted))
-                                    .child("＋"),
+                                    .cursor_pointer()
+                                    .hover(move |this| this.text_color(rgb(colors.text_bright)))
+                                    .child("＋")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.stage_all(cx);
+                                    })),
                             ),
                     )
                     .children(changed_rows)
@@ -1422,7 +1927,6 @@ impl Workspace {
                             .mt_2()
                             .border_t_1()
                             .border_color(rgb(colors.line))
-                            .child(div().text_color(rgb(colors.muted)).child("⌄"))
                             .child(section_label(
                                 colors,
                                 format!("STAGED CHANGES  {staged_count}"),
@@ -1430,9 +1934,16 @@ impl Workspace {
                             .child(div().flex_1())
                             .child(
                                 div()
-                                    .text_size(px(17.))
+                                    .id("unstage-all")
+                                    .px_1()
+                                    .text_size(px(15.))
                                     .text_color(rgb(colors.muted))
-                                    .child("−"),
+                                    .cursor_pointer()
+                                    .hover(move |this| this.text_color(rgb(colors.text_bright)))
+                                    .child("−")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.unstage_all(cx);
+                                    })),
                             ),
                     )
                     .children(staged_rows)
@@ -1446,7 +1957,7 @@ impl Workspace {
                                     .h(px(28.))
                                     .px_3()
                                     .gap_2()
-                                    .child(section_label(colors, "SOURCE FILE TREE")),
+                                    .child(section_label(colors, "FILES")),
                             )
                             .children(tree_rows),
                     ),
@@ -1466,20 +1977,50 @@ impl Workspace {
                             .border_1()
                             .border_color(rgb(colors.line_strong))
                             .bg(rgb(colors.editor))
+                            .id("commit-message")
+                            .cursor_text()
                             .text_size(px(13.))
-                            .text_color(rgb(colors.dim))
-                            .child("Message (Ctrl+Enter to commit)"),
+                            .when(self.composing, |this| this.border_color(rgb(colors.local)))
+                            .text_color(rgb(if self.commit_message.is_empty() {
+                                colors.dim
+                            } else {
+                                colors.text
+                            }))
+                            .child(if !self.commit_message.is_empty() {
+                                self.commit_message.clone()
+                            } else if self.composing {
+                                "Type a message, Escape to stop".to_string()
+                            } else if staged_count == 0 {
+                                "Stage a change to commit".to_string()
+                            } else {
+                                "Select here to write a message".to_string()
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.composing = true;
+                                cx.notify();
+                            })),
                     )
                     .child(
                         row()
+                            .id("commit-button")
                             .h(px(28.))
                             .justify_center()
                             .rounded(px(4.))
-                            .bg(rgb(colors.local))
+                            .bg(rgb(if staged_count == 0 {
+                                colors.line_strong
+                            } else {
+                                colors.local
+                            }))
                             .text_color(rgb(colors.editor))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_size(px(13.))
-                            .child("Commit  ·  demo"),
+                            .when(staged_count > 0, |this| {
+                                this.cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.commit_staged(cx);
+                                    }))
+                            })
+                            .child("Commit"),
                     ),
             )
     }
@@ -1603,30 +2144,43 @@ impl Workspace {
 
     fn branches_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
-        let shown = self.visible_branches.len();
+        let branches: Vec<String> = self
+            .data()
+            .map(|data| data.branches.clone())
+            .unwrap_or_default();
+        let head = self
+            .data()
+            .and_then(|data| data.status.branch.clone())
+            .unwrap_or_default();
+        let chosen = self.visible_branches.len();
+
         self.picker("branches-panel", "Branches", cx)
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(colors.dim))
-                    .child(format!(
-                        "{shown} of {} shown. The graph draws up to {} lanes.",
-                        demo::BRANCHES.len(),
-                        graph::LANE_CAPACITY
-                    )),
+                    .child(if chosen == 0 {
+                        format!(
+                            "Showing every ref. Choose up to {} to narrow the history.",
+                            graph::LANE_CAPACITY
+                        )
+                    } else {
+                        format!("{chosen} of {} branches shown.", branches.len())
+                    }),
             )
-            .children(demo::BRANCHES.iter().enumerate().map(|(index, &branch)| {
-                let lane = self.visible_branches.iter().position(|b| *b == branch);
-                let full = lane.is_none() && shown >= graph::LANE_CAPACITY;
+            .children(branches.iter().take(60).enumerate().map(|(index, branch)| {
+                let position = self.visible_branches.iter().position(|b| b == branch);
+                let full = position.is_none() && chosen >= graph::LANE_CAPACITY;
+                let name = branch.clone();
                 Self::picker_row(
                     colors,
                     SharedString::from(format!("branch-{index}")),
-                    branch,
-                    colors.branch(lane.unwrap_or(0)),
-                    lane.is_some(),
+                    branch.clone(),
+                    colors.branch(position.unwrap_or(0)),
+                    position.is_some(),
                     !full,
                 )
-                .when(branch == demo::HEAD_BRANCH, |this| {
+                .when(*branch == head, |this| {
                     this.child(
                         div()
                             .text_size(px(11.))
@@ -1635,9 +2189,26 @@ impl Workspace {
                     )
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_branch(branch, cx);
+                    this.toggle_branch(name.clone(), cx);
                 }))
             }))
+            .child(
+                row()
+                    .id("show-all-branches")
+                    .h(px(28.))
+                    .px_2()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(rgb(colors.remote))
+                    .hover(move |this| this.bg(rgb(colors.hover)))
+                    .child("Show every ref")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.visible_branches.clear();
+                        this.commit = 0;
+                        this.reload(cx);
+                    })),
+            )
     }
 
     fn settings_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1758,34 +2329,36 @@ impl Workspace {
 
     /// The status bar reports the real repository VGit was launched from, so
     /// the counts here are computed by Git rather than read from the fixture.
+    /// Reports the real repository: its branch, how far it has diverged from
+    /// its upstream, and how many paths are changed and staged.
     fn statusbar(&self) -> impl IntoElement {
         let colors = self.colors();
-        let (branch, ahead_behind, counts) = match &self.repository {
-            RepositoryProbe::Loading => ("⑂ …".to_string(), String::new(), String::new()),
-            RepositoryProbe::Unavailable(_) => {
-                ("⑂ no repository".to_string(), String::new(), String::new())
-            }
-            RepositoryProbe::Opened { status, .. } => {
+        let (branch, divergence, counts) = match &self.repo {
+            RepoState::Loading => ("⑂ …".to_string(), String::new(), String::new()),
+            RepoState::Failed(_) => ("⑂ no repository".to_string(), String::new(), String::new()),
+            RepoState::Ready(data) => {
+                let status = &data.status;
                 let branch = match (&status.branch, status.detached) {
                     (Some(name), _) => format!("⑂ {name}"),
                     (None, true) => "⑂ detached".to_string(),
-                    (None, false) => "⑂ no branch".to_string(),
+                    (None, false) => "⑂ unborn".to_string(),
                 };
-                let ahead_behind = if status.ahead == 0 && status.behind == 0 {
-                    status
-                        .upstream
-                        .as_ref()
-                        .map(|_| "up to date".to_string())
-                        .unwrap_or_default()
+                let divergence = if status.upstream.is_none() {
+                    "no upstream".to_string()
+                } else if status.ahead == 0 && status.behind == 0 {
+                    "up to date".to_string()
                 } else {
                     format!("↑{} ↓{}", status.ahead, status.behind)
                 };
-                let counts = format!(
-                    "● {}  ✓ {}",
-                    status.changed().count(),
-                    status.staged().count()
-                );
-                (branch, ahead_behind, counts)
+                (
+                    branch,
+                    divergence,
+                    format!(
+                        "● {}  ✓ {}",
+                        status.changed().count(),
+                        status.staged().count()
+                    ),
+                )
             }
         };
 
@@ -1798,116 +2371,11 @@ impl Workspace {
             .text_color(rgb(colors.editor))
             .text_size(px(12.))
             .child(branch)
-            .when(!ahead_behind.is_empty(), |this| this.child(ahead_behind))
+            .when(!divergence.is_empty(), |this| this.child(divergence))
             .when(!counts.is_empty(), |this| this.child(counts))
             .child(div().flex_1().child(self.message.clone()))
-            .child("Rust")
             .child("UTF-8")
-            .child("LF")
             .child("GPUI")
-    }
-
-    /// A panel showing what the Git layer read from the real repository,
-    /// deliberately separate from the fixture history above it.
-    fn live_repository(&self) -> impl IntoElement {
-        let colors = self.colors();
-        let field = |label: &'static str, value: String, accent: u32| {
-            row()
-                .text_size(px(12.))
-                .child(
-                    div()
-                        .w(px(86.))
-                        .flex_none()
-                        .text_color(rgb(colors.muted))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(rgb(accent))
-                        .child(value),
-                )
-        };
-
-        let body = match &self.repository {
-            RepositoryProbe::Loading => {
-                vec![field("Status", "Reading…".to_string(), colors.muted).into_any_element()]
-            }
-            RepositoryProbe::Unavailable(reason) => vec![
-                field("Status", "Unavailable".to_string(), colors.red).into_any_element(),
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(colors.dim))
-                    .child(reason.clone())
-                    .into_any_element(),
-            ],
-            RepositoryProbe::Opened {
-                root,
-                status,
-                commits,
-                references,
-            } => {
-                let name = root.rsplit('/').next().unwrap_or(root).to_string();
-                vec![
-                    field("Repository", name, colors.text).into_any_element(),
-                    field(
-                        "Branch",
-                        status
-                            .branch
-                            .clone()
-                            .unwrap_or_else(|| "detached".to_string()),
-                        colors.local,
-                    )
-                    .into_any_element(),
-                    field(
-                        "Upstream",
-                        status
-                            .upstream
-                            .clone()
-                            .unwrap_or_else(|| "none".to_string()),
-                        colors.remote,
-                    )
-                    .into_any_element(),
-                    field(
-                        "Ahead",
-                        format!("{} ahead · {} behind", status.ahead, status.behind),
-                        colors.merge,
-                    )
-                    .into_any_element(),
-                    field(
-                        "Changes",
-                        format!(
-                            "{} changed · {} staged",
-                            status.changed().count(),
-                            status.staged().count()
-                        ),
-                        colors.text,
-                    )
-                    .into_any_element(),
-                    field("History", format!("{commits} commits"), colors.text).into_any_element(),
-                    field("Refs", format!("{references} refs"), colors.text).into_any_element(),
-                ]
-            }
-        };
-
-        column()
-            .px_3()
-            .pb_3()
-            .gap_1()
-            .child(
-                row()
-                    .h(px(26.))
-                    .child(section_label(colors, "LIVE REPOSITORY")),
-            )
-            .children(body)
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(colors.dim))
-                    .child("Read from the working directory with git."),
-            )
     }
 }
 
@@ -1931,7 +2399,7 @@ impl Render for Workspace {
                 this.step_commit(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowDiff, _, cx| {
-                this.open_tab(Tab::Diff { file: this.file }, cx);
+                this.select_file(this.file, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowSource, _, cx| {
                 match this
@@ -1943,7 +2411,13 @@ impl Render for Workspace {
                         this.active_tab = index;
                         cx.notify();
                     }
-                    None => this.open_source(DEFAULT_SOURCE, cx),
+                    None => {
+                        if let Some(entry) =
+                            this.visible_tree().into_iter().find(|row| !row.directory)
+                        {
+                            this.open_source(entry.path, cx);
+                        }
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleStage, _, cx| {
@@ -1957,6 +2431,14 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(|_: &Close, window, _| window.remove_window())
+            // Captured before the key bindings run, so typing a message
+            // cannot trigger Space to stage or Up to move the selection.
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.type_into_message(event) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 let Some((origin_x, origin_width)) = this.resize_origin else {
                     return;
@@ -2064,7 +2546,7 @@ mod tests {
     }
 
     fn all_columns_width() -> f32 {
-        graph::GRAPH_WIDTH + COLUMNS.iter().map(|c| c.width()).sum::<f32>()
+        graph::gutter_width(graph::LANE_CAPACITY) + COLUMNS.iter().map(|c| c.width()).sum::<f32>()
     }
 
     #[test]
@@ -2146,6 +2628,90 @@ mod tests {
         // Closing an active tab in the middle holds the position.
         assert_eq!(active_after_close(1, 1, 3), 1);
         assert_eq!(active_after_close(1, 1, 2), 1);
+    }
+
+    // ---- The source tree ------------------------------------------------
+
+    fn tree_of(paths: &[&str]) -> Vec<TreeRow> {
+        build_tree(&paths.iter().map(|p| p.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_flat_list_of_paths_becomes_an_indented_tree() {
+        let rows = tree_of(&["src/git.rs", "src/main.rs"]);
+        let shape: Vec<(usize, &str, bool)> = rows
+            .iter()
+            .map(|row| (row.depth, row.name.as_str(), row.directory))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, "src", true),
+                (1, "git.rs", false),
+                (1, "main.rs", false),
+            ]
+        );
+    }
+
+    /// A directory is emitted once, no matter how many files it holds.
+    #[test]
+    fn a_shared_directory_is_not_repeated() {
+        let rows = tree_of(&["a/b/one.rs", "a/b/two.rs", "a/three.rs"]);
+        let directories: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.directory)
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(directories, vec!["a", "a/b"]);
+    }
+
+    /// Leaving a directory and entering a sibling must not nest the sibling
+    /// inside the one just closed.
+    #[test]
+    fn leaving_a_directory_returns_to_the_right_depth() {
+        let rows = tree_of(&["a/deep/one.rs", "b/two.rs"]);
+        let b = rows.iter().find(|row| row.path == "b").expect("b");
+        assert_eq!(b.depth, 0);
+        let two = rows.iter().find(|row| row.path == "b/two.rs").expect("two");
+        assert_eq!(two.depth, 1);
+    }
+
+    #[test]
+    fn every_tree_row_keeps_its_full_path() {
+        for row in tree_of(&["a/b/c.rs"]) {
+            assert!(row.path.ends_with(&row.name), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_at_the_root_has_no_directory_above_it() {
+        let rows = tree_of(&["README.md"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].depth, 0);
+        assert!(!rows[0].directory);
+    }
+
+    #[test]
+    fn an_empty_repository_has_an_empty_tree() {
+        assert!(tree_of(&[]).is_empty());
+    }
+
+    // ---- Diff hunk headers ----------------------------------------------
+
+    /// Line numbers in the diff follow the new side of the hunk.
+    #[test]
+    fn a_hunk_header_yields_its_new_side_start_line() {
+        assert_eq!(hunk_start("@@ -1,4 +1,6 @@"), Some(1));
+        assert_eq!(hunk_start("@@ -18,10 +24,12 @@ fn render()"), Some(24));
+        assert_eq!(hunk_start("@@ -0,0 +1 @@"), Some(1));
+    }
+
+    #[test]
+    fn an_ordinary_line_is_not_read_as_a_hunk_header() {
+        assert_eq!(hunk_start("+ added line"), None);
+        assert_eq!(hunk_start("   context"), None);
+        assert_eq!(hunk_start(""), None);
+        assert_eq!(hunk_start("@@ malformed"), None);
     }
 
     /// Every column has a distinct label, so the picker is unambiguous.

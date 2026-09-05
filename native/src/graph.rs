@@ -1,15 +1,16 @@
-use crate::{demo::COMMITS, theme::Palette};
+use crate::{git, theme::Palette};
 use gpui::{Bounds, PathBuilder, canvas, point, prelude::*, px, quad, rgb, size};
+use std::collections::HashMap;
 
 pub const ROW_HEIGHT: f32 = 28.;
 
-/// Width of the graph gutter. Sized to hold [`LANE_CAPACITY`] rails plus the
-/// radius of a node dot, so branches never paint into the commit columns.
-pub const GRAPH_WIDTH: f32 = LANE_ORIGIN + (LANE_CAPACITY - 1) as f32 * LANE_STEP + 16.;
-
-/// How many branches the gutter can show at once. A repository may hold more,
-/// in which case the sidebar offers a selection of which to draw.
+/// How many branches the branch picker will let you choose at once.
 pub const LANE_CAPACITY: usize = 5;
+
+/// The widest gutter the graph will draw. A busy repository can need more
+/// concurrent rails than this; those are folded onto the last lane rather than
+/// pushing the commit columns off screen.
+pub const MAX_LANES: usize = 10;
 
 /// Horizontal center of the first lane, and the spacing between lanes.
 const LANE_ORIGIN: f32 = 22.;
@@ -24,77 +25,145 @@ const JOG: f32 = 12.;
 /// the horizontal connector between them.
 const MAX_SEGMENTS: usize = 5;
 
-/// One visible row of history: the commit it shows, the lane its branch was
-/// given, and the rows its parents resolved to.
+/// Width of the gutter needed to draw `lanes` rails plus a node radius.
+pub fn gutter_width(lanes: usize) -> f32 {
+    LANE_ORIGIN + (lanes.clamp(1, MAX_LANES) - 1) as f32 * LANE_STEP + 16.
+}
+
+/// One visible row of history: the commit it shows, the lane it was given, and
+/// the rows its parents occupy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub commit: usize,
     pub lane: usize,
     pub parents: Vec<usize>,
+    /// The branch this lane belongs to, taken from the ref that opened it.
+    /// A commit reachable only from a merged-away tip has no label.
+    pub label: Option<String>,
 }
 
-/// Builds the visible rows for a branch selection.
+/// A laid-out history.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Graph {
+    pub rows: Vec<Row>,
+    /// How many lanes are actually occupied, for sizing the gutter.
+    pub lanes: usize,
+}
+
+/// Assigns a lane to every commit.
 ///
-/// A commit is shown when its branch is selected, and takes the lane of that
-/// branch's position in `selected`. An edge whose parent sits on a hidden
-/// branch is redirected to the nearest visible ancestor, so hiding a branch
-/// never breaks the history into disconnected pieces.
-pub fn rows(selected: &[&str]) -> Vec<Row> {
-    let lane: Vec<Option<usize>> = COMMITS
+/// A commit does not belong to a branch in Git, so lanes are derived from
+/// topology rather than read off the commit. Walking newest-first, each active
+/// lane remembers the commit it is waiting for. A commit takes the lane that
+/// was waiting for it, or a free lane if it is the tip of something new, and
+/// then hands its lane to its first parent. Additional parents of a merge open
+/// lanes of their own, which is what makes a merge visibly rejoin.
+///
+/// `commits` must be ordered newest-first, as `git log` returns them.
+pub fn assign_lanes(commits: &[git::Commit]) -> Graph {
+    let row_of: HashMap<&str, usize> = commits
         .iter()
-        .map(|commit| selected.iter().position(|name| *name == commit.branch))
+        .enumerate()
+        .map(|(index, commit)| (commit.id.as_str(), index))
         .collect();
 
-    let mut row_of = vec![usize::MAX; COMMITS.len()];
-    let mut order = Vec::new();
-    for (commit, lane) in lane.iter().enumerate() {
-        if lane.is_some() {
-            row_of[commit] = order.len();
-            order.push(commit);
+    // What each lane is waiting for, and the branch it was opened for.
+    let mut waiting: Vec<Option<String>> = Vec::new();
+    let mut labels: Vec<Option<String>> = Vec::new();
+    let mut rows = Vec::with_capacity(commits.len());
+    let mut widest = 1;
+
+    let open_lane =
+        |waiting: &mut Vec<Option<String>>, labels: &mut Vec<Option<String>>| -> usize {
+            match waiting.iter().position(Option::is_none) {
+                Some(lane) => lane,
+                None => {
+                    waiting.push(None);
+                    labels.push(None);
+                    waiting.len() - 1
+                }
+            }
+        };
+
+    for (index, commit) in commits.iter().enumerate() {
+        let expecting: Vec<usize> = waiting
+            .iter()
+            .enumerate()
+            .filter(|(_, want)| want.as_deref() == Some(commit.id.as_str()))
+            .map(|(lane, _)| lane)
+            .collect();
+
+        let lane = match expecting.first() {
+            Some(&lane) => lane,
+            None => {
+                let lane = open_lane(&mut waiting, &mut labels);
+                labels[lane] = branch_label(commit);
+                lane
+            }
+        };
+
+        // Several rails converging on one commit collapse into its lane.
+        for &merged in expecting.iter().skip(1) {
+            waiting[merged] = None;
+            labels[merged] = None;
         }
+
+        // A tip that carries a branch name renames the rail it sits on.
+        if let Some(name) = branch_label(commit) {
+            labels[lane] = Some(name);
+        }
+
+        let mut parents = Vec::new();
+        for (position, parent) in commit.parents.iter().enumerate() {
+            if let Some(&row) = row_of.get(parent.as_str()) {
+                parents.push(row);
+            }
+            if position == 0 {
+                waiting[lane] = Some(parent.clone());
+            } else if !waiting
+                .iter()
+                .any(|want| want.as_deref() == Some(parent.as_str()))
+            {
+                let opened = open_lane(&mut waiting, &mut labels);
+                waiting[opened] = Some(parent.clone());
+                labels[opened] = labels[lane].clone();
+            }
+        }
+        if commit.parents.is_empty() {
+            waiting[lane] = None;
+        }
+
+        widest = widest.max(
+            waiting
+                .iter()
+                .filter(|want| want.is_some())
+                .count()
+                .max(lane + 1),
+        );
+        rows.push(Row {
+            commit: index,
+            lane: lane.min(MAX_LANES - 1),
+            parents,
+            label: labels[lane].clone(),
+        });
     }
 
-    order
-        .iter()
-        .map(|&commit| {
-            let mut visible_parents = Vec::new();
-            let mut seen = Vec::new();
-            for &parent in COMMITS[commit].parents {
-                nearest_visible(parent, &lane, &mut visible_parents, &mut seen);
-            }
-            Row {
-                commit,
-                lane: lane[commit].expect("commit is visible"),
-                parents: visible_parents
-                    .into_iter()
-                    .map(|commit| row_of[commit])
-                    .collect(),
-            }
-        })
-        .collect()
+    Graph {
+        rows,
+        lanes: widest.clamp(1, MAX_LANES),
+    }
 }
 
-/// Walks up from `commit` until it reaches visible ancestors, collecting each
-/// one exactly once.
-fn nearest_visible(
-    commit: usize,
-    lane: &[Option<usize>],
-    found: &mut Vec<usize>,
-    seen: &mut Vec<usize>,
-) {
-    if lane[commit].is_some() {
-        if !found.contains(&commit) {
-            found.push(commit);
-        }
-        return;
-    }
-    if seen.contains(&commit) {
-        return;
-    }
-    seen.push(commit);
-    for &parent in COMMITS[commit].parents {
-        nearest_visible(parent, lane, found, seen);
-    }
+/// The branch a commit is a tip of, preferring a local branch over a remote
+/// one. Tags are not branches and never name a rail.
+fn branch_label(commit: &git::Commit) -> Option<String> {
+    let is_tag = |name: &str| name.starts_with('v') && name.contains('.');
+    commit
+        .refs
+        .iter()
+        .find(|name| !name.contains('/') && !is_tag(name))
+        .or_else(|| commit.refs.iter().find(|name| !is_tag(name)))
+        .cloned()
 }
 
 /// One piece of a routed connector, in canvas-local pixels.
@@ -200,34 +269,35 @@ pub fn edge_route(child: (usize, usize), parent: (usize, usize)) -> EdgeRoute {
     }
 }
 
-fn commit_color(index: usize, lane: usize, colors: Palette) -> u32 {
-    let commit = &COMMITS[index];
-    if commit.parents.len() > 1 {
+/// The color of a commit's node. Merges keep the merge amber so they stay
+/// distinguishable from the branch rails around them.
+fn commit_color(commit: &git::Commit, lane: usize, colors: Palette) -> u32 {
+    if commit.is_merge() {
         colors.merge
-    } else if commit.reference.contains("origin/") {
-        colors.remote
-    } else if commit.reference.starts_with('v') {
-        colors.tag
     } else {
         colors.branch(lane)
     }
 }
 
-/// Paints a compact, native commit graph for the history sidebar.
+/// Paints the commit graph for the history sidebar.
 ///
-/// Every visible branch has a straight vertical rail, joined across lanes by
+/// Every lane is a straight vertical rail, joined across lanes by
 /// [`edge_route`]. Regular commits use a filled inner dot; merge commits use a
 /// hollow inner dot so topology is readable without relying on color alone.
-pub fn sidebar_graph(rows: Vec<Row>, colors: Palette) -> impl IntoElement {
-    let height = rows.len() as f32 * ROW_HEIGHT;
+pub fn sidebar_graph(graph: Graph, commits: Vec<git::Commit>, colors: Palette) -> impl IntoElement {
+    let height = graph.rows.len() as f32 * ROW_HEIGHT;
+    let width = gutter_width(graph.lanes);
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
             let at = |x: f32, y: f32| bounds.origin + point(px(x), px(y));
 
-            for (index, row) in rows.iter().enumerate() {
+            for (index, row) in graph.rows.iter().enumerate() {
                 for &parent in &row.parents {
-                    let route = edge_route((index, row.lane), (parent, rows[parent].lane));
+                    let Some(parent_row) = graph.rows.get(parent) else {
+                        continue;
+                    };
+                    let route = edge_route((index, row.lane), (parent, parent_row.lane));
                     let mut path = PathBuilder::stroke(px(2.));
                     path.move_to(at(route.start.0, route.start.1));
                     for segment in route.segments() {
@@ -237,14 +307,17 @@ pub fn sidebar_graph(rows: Vec<Row>, colors: Palette) -> impl IntoElement {
                         }
                     }
                     if let Ok(path) = path.build() {
-                        window.paint_path(path, rgb(colors.branch(rows[parent].lane)));
+                        window.paint_path(path, rgb(colors.branch(parent_row.lane)));
                     }
                 }
             }
 
-            for (index, row) in rows.iter().enumerate() {
+            for (index, row) in graph.rows.iter().enumerate() {
+                let Some(commit) = commits.get(row.commit) else {
+                    continue;
+                };
                 let center = at(lane_x(row.lane), row_y(index));
-                let color = commit_color(row.commit, row.lane, colors);
+                let color = commit_color(commit, row.lane, colors);
 
                 window.paint_quad(quad(
                     Bounds::new(center - point(px(6.), px(6.)), size(px(12.), px(12.))),
@@ -255,7 +328,7 @@ pub fn sidebar_graph(rows: Vec<Row>, colors: Palette) -> impl IntoElement {
                     Default::default(),
                 ));
 
-                let merge = COMMITS[row.commit].parents.len() > 1;
+                let merge = commit.is_merge();
                 window.paint_quad(quad(
                     Bounds::new(center - point(px(2.5), px(2.5)), size(px(5.), px(5.))),
                     px(2.5),
@@ -267,7 +340,7 @@ pub fn sidebar_graph(rows: Vec<Row>, colors: Palette) -> impl IntoElement {
             }
         },
     )
-    .w(px(GRAPH_WIDTH))
+    .w(px(width))
     .h(px(height))
     .absolute()
     .top_0()
@@ -277,110 +350,177 @@ pub fn sidebar_graph(rows: Vec<Row>, colors: Palette) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::demo::BRANCHES;
 
-    fn default_selection() -> Vec<&'static str> {
-        BRANCHES.iter().take(LANE_CAPACITY).copied().collect()
+    /// Builds a commit with the given id, parents, and ref decoration.
+    fn commit(id: &str, parents: &[&str], refs: &[&str]) -> git::Commit {
+        git::Commit {
+            id: id.to_string(),
+            short_id: id.to_string(),
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+            author: "Test".into(),
+            email: "test@example.invalid".into(),
+            timestamp: 0,
+            relative_time: "now".into(),
+            refs: refs.iter().map(|r| r.to_string()).collect(),
+            subject: format!("Commit {id}"),
+        }
     }
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 0.01
     }
 
+    /// A straight chain stays in one lane.
     #[test]
-    fn the_gutter_holds_its_advertised_lane_capacity() {
-        let last = lane_x(LANE_CAPACITY - 1);
-        assert!(last + 6. <= GRAPH_WIDTH, "lane {LANE_CAPACITY} overflows");
+    fn a_linear_history_uses_a_single_lane() {
+        let commits = vec![
+            commit("c", &["b"], &["main"]),
+            commit("b", &["a"], &[]),
+            commit("a", &[], &[]),
+        ];
+        let graph = assign_lanes(&commits);
+        assert_eq!(graph.lanes, 1);
+        assert!(graph.rows.iter().all(|row| row.lane == 0));
+        assert_eq!(graph.rows[0].parents, vec![1]);
+        assert_eq!(graph.rows[2].parents, Vec::<usize>::new());
+    }
+
+    /// A merge puts its second parent on a lane of its own, and that lane
+    /// closes again where the side branch joins the trunk.
+    #[test]
+    fn a_merge_opens_a_second_lane_that_closes_at_the_fork() {
+        // m -> (t, s); t -> base; s -> base; base
+        let commits = vec![
+            commit("m", &["t", "s"], &["main"]),
+            commit("t", &["base"], &[]),
+            commit("s", &["base"], &["feature"]),
+            commit("base", &[], &[]),
+        ];
+        let graph = assign_lanes(&commits);
+
+        assert_eq!(graph.rows[0].lane, 0, "the merge stays on the trunk");
+        assert_eq!(graph.rows[1].lane, 0, "the first parent keeps the lane");
+        assert_ne!(graph.rows[2].lane, 0, "the second parent gets its own lane");
+        assert_eq!(graph.rows[3].lane, 0, "the fork point returns to the trunk");
+        assert_eq!(graph.lanes, 2);
+
+        // Both sides of the merge point at the fork.
+        assert_eq!(graph.rows[1].parents, vec![3]);
+        assert_eq!(graph.rows[2].parents, vec![3]);
     }
 
     #[test]
-    fn the_fixture_has_more_branches_than_the_gutter_can_show() {
-        assert!(
-            BRANCHES.len() > LANE_CAPACITY,
-            "branch selection would be pointless with {} branches",
-            BRANCHES.len()
+    fn a_merge_records_both_parents() {
+        let commits = vec![
+            commit("m", &["t", "s"], &[]),
+            commit("t", &[], &[]),
+            commit("s", &[], &[]),
+        ];
+        let graph = assign_lanes(&commits);
+        assert_eq!(graph.rows[0].parents, vec![1, 2]);
+    }
+
+    /// Two unrelated tips each get a lane, and neither is dropped.
+    #[test]
+    fn independent_tips_get_their_own_lanes() {
+        let commits = vec![
+            commit("a2", &["a1"], &["main"]),
+            commit("b2", &["b1"], &["other"]),
+            commit("a1", &[], &[]),
+            commit("b1", &[], &[]),
+        ];
+        let graph = assign_lanes(&commits);
+        assert_ne!(graph.rows[0].lane, graph.rows[1].lane);
+        assert_eq!(graph.rows[0].lane, graph.rows[2].lane);
+        assert_eq!(graph.rows[1].lane, graph.rows[3].lane);
+    }
+
+    /// A parent outside the loaded window is simply not drawn, rather than
+    /// producing an edge to a row that does not exist.
+    #[test]
+    fn a_parent_beyond_the_loaded_history_is_dropped() {
+        let commits = vec![commit("b", &["a"], &["main"])];
+        let graph = assign_lanes(&commits);
+        assert!(graph.rows[0].parents.is_empty());
+    }
+
+    /// Every edge must point at a row that exists, and always downwards.
+    #[test]
+    fn every_edge_points_at_a_later_row() {
+        let commits = vec![
+            commit("f", &["e", "c"], &["main"]),
+            commit("e", &["d"], &[]),
+            commit("d", &["b"], &[]),
+            commit("c", &["b"], &["side"]),
+            commit("b", &["a"], &[]),
+            commit("a", &[], &[]),
+        ];
+        let graph = assign_lanes(&commits);
+        for (index, row) in graph.rows.iter().enumerate() {
+            for &parent in &row.parents {
+                assert!(parent < graph.rows.len(), "row {index} points off the end");
+                assert!(parent > index, "row {index} points back at {parent}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_lane_is_named_after_the_branch_that_opened_it() {
+        let commits = vec![
+            commit("c", &["b"], &["main"]),
+            commit("b", &["a"], &[]),
+            commit("a", &[], &[]),
+        ];
+        let graph = assign_lanes(&commits);
+        assert_eq!(graph.rows[0].label.as_deref(), Some("main"));
+        assert_eq!(graph.rows[1].label.as_deref(), Some("main"));
+    }
+
+    /// A tag is not a branch and must not name a rail.
+    #[test]
+    fn a_tag_does_not_name_a_lane() {
+        let commits = vec![commit("a", &[], &["v1.2.0"])];
+        assert_eq!(assign_lanes(&commits).rows[0].label, None);
+    }
+
+    #[test]
+    fn a_local_branch_is_preferred_over_a_remote_one() {
+        let commits = vec![commit("a", &[], &["origin/main", "main"])];
+        assert_eq!(
+            assign_lanes(&commits).rows[0].label.as_deref(),
+            Some("main")
         );
     }
 
-    /// Every commit belongs to a branch the branch list knows about.
     #[test]
-    fn every_commit_sits_on_a_known_branch() {
-        for commit in COMMITS {
-            assert!(
-                BRANCHES.contains(&commit.branch),
-                "unknown branch {}",
-                commit.branch
-            );
+    fn an_empty_history_lays_out_without_panicking() {
+        let graph = assign_lanes(&[]);
+        assert!(graph.rows.is_empty());
+        assert_eq!(graph.lanes, 1);
+    }
+
+    /// A repository busier than the gutter folds onto the last lane rather
+    /// than painting over the commit columns.
+    #[test]
+    fn lanes_never_exceed_the_drawable_maximum() {
+        let mut commits = Vec::new();
+        for index in 0..(MAX_LANES * 3) {
+            commits.push(commit(&format!("tip{index}"), &[], &[]));
         }
-    }
-
-    /// Parents must always be older, or the graph would route backwards.
-    #[test]
-    fn parents_are_always_older_than_their_children() {
-        for (index, commit) in COMMITS.iter().enumerate() {
-            for &parent in commit.parents {
-                assert!(parent > index, "commit {index} has a parent at {parent}");
-            }
-        }
+        let graph = assign_lanes(&commits);
+        assert!(graph.lanes <= MAX_LANES);
+        assert!(graph.rows.iter().all(|row| row.lane < MAX_LANES));
     }
 
     #[test]
-    fn a_selection_only_shows_its_own_branches() {
-        let selected = vec!["main", "feature/graph"];
-        for row in rows(&selected) {
-            assert!(selected.contains(&COMMITS[row.commit].branch));
-        }
+    fn the_gutter_grows_with_the_lanes_it_must_hold() {
+        assert!(gutter_width(1) < gutter_width(5));
+        assert_eq!(gutter_width(MAX_LANES), gutter_width(MAX_LANES + 5));
+        let widest = lane_x(MAX_LANES - 1) + 6.;
+        assert!(widest <= gutter_width(MAX_LANES));
     }
 
-    #[test]
-    fn lanes_follow_the_order_of_the_selection() {
-        let selected = vec!["feature/themes", "main"];
-        for row in rows(&selected) {
-            let expected = if COMMITS[row.commit].branch == "feature/themes" {
-                0
-            } else {
-                1
-            };
-            assert_eq!(row.lane, expected);
-        }
-    }
-
-    #[test]
-    fn every_selection_stays_inside_the_lane_capacity() {
-        let selected = default_selection();
-        assert!(rows(&selected).iter().all(|row| row.lane < LANE_CAPACITY));
-    }
-
-    /// Hiding a branch must not orphan the commits below it: an edge into a
-    /// hidden parent is redirected to the nearest visible ancestor.
-    #[test]
-    fn hiding_a_branch_keeps_the_history_connected() {
-        let selected = vec!["main"];
-        let rows = rows(&selected);
-        assert!(rows.len() > 1);
-        for (index, row) in rows.iter().enumerate() {
-            for &parent in &row.parents {
-                assert!(parent > index, "row {index} points back at {parent}");
-                assert!(parent < rows.len(), "row {index} points outside the list");
-            }
-        }
-        // Only the root may be without a parent.
-        let childless = rows.iter().filter(|row| row.parents.is_empty()).count();
-        assert_eq!(childless, 1, "history split into disconnected pieces");
-    }
-
-    #[test]
-    fn a_merge_keeps_both_parents_when_both_are_visible() {
-        let selected = default_selection();
-        let rows = rows(&selected);
-        let merge = rows
-            .iter()
-            .find(|row| {
-                COMMITS[row.commit].parents.len() > 1 && COMMITS[row.commit].branch == "main"
-            })
-            .expect("the fixture has a merge on main");
-        assert_eq!(merge.parents.len(), 2);
-    }
+    // ---- Edge routing --------------------------------------------------
 
     #[test]
     fn every_route_ends_on_its_parent() {
@@ -436,12 +576,12 @@ mod tests {
 
     #[test]
     fn routes_stay_inside_the_graph_gutter() {
-        for lane in 0..LANE_CAPACITY {
-            for other in 0..LANE_CAPACITY {
+        for lane in 0..MAX_LANES {
+            for other in 0..MAX_LANES {
                 let route = edge_route((0, lane), (3, other));
                 for segment in route.segments() {
                     let (x, _) = segment.end();
-                    assert!((0. ..=GRAPH_WIDTH).contains(&x), "x={x}");
+                    assert!((0. ..=gutter_width(MAX_LANES)).contains(&x), "x={x}");
                 }
             }
         }

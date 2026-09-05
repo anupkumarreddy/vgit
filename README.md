@@ -8,11 +8,11 @@ VGit is an open-source visual desktop Git client written in Rust with
 [GPUI](https://www.gpui.rs/). It presents commits, branches, tags, remotes,
 hashes, authors, and merge paths as an approachable repository map.
 
-> **Status: the interface is a prototype; the Git layer is real.**
-> `native/src/git.rs` runs the installed `git` binary and parses its output,
-> and the **Live repository** panel shows it reading the working directory
-> VGit was launched from. The history graph, diffs, and file lists on screen
-> are still an in-memory fixture. See
+> **Status: VGit reads and writes real repositories.** It opens the repository
+> it is launched from and shows its real history, diffs, changes, and refs.
+> Staging, unstaging, and committing work. Fetch, pull, push, branch
+> switching, and the destructive operations are implemented and tested in the
+> Git layer but are not yet reachable from a control. See
 > [Project status and roadmap](#project-status-and-roadmap).
 
 VGit was previously an Electron, React, and TypeScript application. That
@@ -49,28 +49,29 @@ The local bundle is unsigned and intended for development only.
 
 ## Explore the prototype
 
-- **Repository graph:** each visible branch keeps its own colored rail. Lane
-  changes are drawn as a horizontal connector with small corners, and merge
-  commits use a hollow inner dot so topology reads without relying on color.
+- **Repository graph:** every branch keeps its own colored rail. Lanes are
+  derived from the commit graph rather than stored on a commit, so the layout
+  follows real topology. Lane changes are drawn as a horizontal connector with
+  small corners, and merge commits use a hollow inner dot.
 - **History columns:** COMMIT, BRANCH, AUTHOR, MESSAGE, and WHEN are fixed
   widths so every row lines up, and the table scrolls sideways. **Columns**
   hides or shows any column except the message.
-- **Branch selection:** the fixture carries eight branches and the graph draws
-  five at a time. **Branches** chooses which. An edge into a hidden parent is
-  redirected to the nearest visible ancestor, so the history stays connected.
+- **Branch selection:** the history shows every ref by default. **Branches**
+  narrows it to as many as five, which is what the graph can label clearly.
+- **Changes:** the right sidebar lists what Git reports as changed and staged.
+  The `+` and `−` on a row stage and unstage that path; the section headers
+  stage or unstage everything.
+- **Committing:** select the message box, type a message, and select Commit.
+  The field is a minimal input that handles typing and backspace.
+- **Diffs:** selecting a change opens `git diff` for that path. Selecting a
+  file under FILES opens its current contents in its own tab.
 - **Sidebar width:** drag the divider beside the editor. The sidebar opens at
   full width and yields to the editor when the window cannot hold both.
-- **Editor:** tabs open per file. Selecting a file in the source tree opens it
-  in its own tab, or focuses an existing one. `Cmd+1` and `Cmd+2` move between
-  the diff and a source tab.
-- **Repository sidebar:** stage and unstage files, collapse the source tree,
-  and read the ref list in the repository state. Selecting a ref jumps the
-  history to the commit it points at.
 - **Appearance:** select the gear at the bottom of the activity bar, then choose
   Dark or Light. The choice is kept for the running session.
-- **Shortcuts:** `Up`/`Down` moves through the visible commits, `Space` toggles
-  the selected file's staging state, `Cmd+,` opens Settings, and `Escape`
-  closes any open panel.
+- **Shortcuts:** `Up`/`Down` moves through the history, `Cmd+1` opens the
+  selected change as a diff, `Cmd+2` focuses a source tab, `Cmd+,` opens
+  Settings, and `Escape` closes any open panel.
 
 Patch snippets and change totals are illustrative fixtures, not computed Git
 output.
@@ -83,23 +84,25 @@ cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warn
 cargo test --locked --manifest-path native/Cargo.toml
 ```
 
-The tests cover lane assignment and branch selection, edge routing geometry,
-the sidebar width clamp, and the Git layer. The Git tests build throwaway
-repositories in the temporary directory and remove them afterwards; fetch and
-push run against a local bare repository, so no test needs network access.
+The tests cover lane assignment over real commit graphs, edge routing
+geometry, the source tree, diff hunk parsing, the sidebar width clamp, and the
+Git layer. The Git tests build throwaway repositories in the temporary
+directory and remove them afterwards; fetch and push run against a local bare
+repository, so no test needs network access.
 
 ## Architecture
 
 ```text
-native/src/main.rs    Desktop window, workspace views, in-memory interactions
-native/src/git.rs     Real repository access: commands, parsers, and operations
-native/src/demo.rs    Sample commits, branches, refs, files, and patch snippets
+native/src/main.rs    Desktop window, workspace views, and repository state
+native/src/git.rs     Repository access: commands, parsers, and operations
 native/src/graph.rs   Lane assignment, edge routing, and canvas painting
 native/src/theme.rs   Palette and shared visual primitives
 ```
 
 Git commands run with argument arrays rather than interpolated shell strings,
-and every call blocks so the caller can run it off the UI thread.
+and every call blocks and runs on a background thread so the window stays
+responsive. Lanes are derived from the commit graph rather than stored on a
+commit, because a commit does not belong to a branch in Git.
 
 Lanes are not stored on a commit. `graph::rows` derives them from the current
 branch selection, which is what lets the gutter show five of eight branches
@@ -115,22 +118,20 @@ and SSH agent. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Project status and roadmap
 
-Done: the Git layer itself. `native/src/git.rs` implements discovery, status,
-log, refs, staging, commit and amend, revert, reset, discard, clean, stash,
-branches, and fetch/pull/push, covered by integration tests against throwaway
-repositories.
+Done: the Git layer, and the interface reading and writing a real repository.
+The history, diffs, changes, refs, and file tree all come from Git, and
+staging, unstaging, and committing work. The fixture has been removed.
 
 Near-term work, in rough order:
 
-1. Point the history graph, diffs, and file lists at a real repository,
-   replacing the fixture
-2. Wire the safe write operations: stage, unstage, commit, amend
-3. Wire fetch, fast-forward pull, and push, with progress and error reporting
-4. Wire the destructive operations behind explicit confirmation: hard reset,
+1. Wire fetch, fast-forward pull, and push, with progress and error reporting
+2. Wire amend, revert, and branch switching
+3. Wire the destructive operations behind explicit confirmation: hard reset,
    discard, and clean
-5. Open an arbitrary repository rather than the launch directory
+4. Open an arbitrary repository rather than the launch directory
+5. A real text editor for the commit message, replacing the minimal input
 6. Search across commit message, author, hash, branch, and tag
-7. Text editing, adjustable pane sizes, and persistence
+7. Conflict resolution, line and hunk staging, and interactive rebase
 
 Later work includes interactive rebase, three-way conflict resolution, line and
 hunk staging, reflog recovery, worktrees, submodules, Git LFS,

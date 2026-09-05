@@ -1,15 +1,14 @@
 # VGit native preview
 
-A desktop workspace written entirely in Rust with GPUI.
+A visual Git client written entirely in Rust with GPUI.
 
-The Git layer in `src/git.rs` is real: it runs the installed `git` binary and
-parses its output. The **Live repository** panel in the right sidebar shows
-that layer reading the working directory VGit was launched from, off the UI
-thread.
+VGit opens the repository it is launched from and shows its real history,
+diffs, changes, and refs. Staging, unstaging, and committing act on that
+repository. There is no fixture data left in the application.
 
-Everything else on screen -- the history graph, diffs, file lists, and source
-tree -- is still the in-memory fixture in `src/demo.rs`. Restarting resets the
-demo staging area.
+Not yet implemented: fetch, pull, push, branch switching, and the destructive
+operations. The Git layer supports them all and they are covered by tests;
+none of them are reachable from a control yet.
 
 ## Run
 
@@ -35,36 +34,30 @@ been developed on macOS; Windows and Linux packaging is not yet validated.
 
 ## Explore
 
-- **Repository graph:** select a commit in the left sidebar. Each visible
-  branch keeps its own colored rail, and lane changes are drawn as a
-  horizontal connector with small corners rather than a long curve. Merge
-  commits use a hollow inner dot so topology reads without relying on color.
-- **History columns:** COMMIT, BRANCH, AUTHOR, MESSAGE, and WHEN are fixed
-  widths, so every row lines up. The table is wider than the sidebar and
-  scrolls sideways. Select **Columns** to hide or show any column except the
-  message.
-- **Branch selection:** the fixture carries eight branches and the gutter
-  draws five at a time. Select **Branches** to choose which. Commits on a
-  hidden branch disappear, and an edge into a hidden parent is redirected to
-  the nearest visible ancestor, so the history never breaks apart.
-- **Sidebar width:** drag the divider between the history and the editor. The
-  sidebar opens at full width and yields to the editor when the window is too
-  narrow to hold both.
-- **Editor:** tabs open per file. Selecting a file in the source tree opens it
-  in its own tab, or focuses the tab if it is already open. Cmd+1/Ctrl+1 and
-  Cmd+2/Ctrl+2 move between the diff and a source tab.
-- **Repository sidebar:** stage or unstage files, expand and collapse the
-  source tree, and read the ref list in the repository state. Selecting a ref
-  jumps the history to the commit it points at.
-- **Appearance:** select the gear at the bottom of the activity bar, then
-  choose Dark or Light. The choice is kept for the running preview session.
-- **Shortcuts:** Up/Down moves through the visible commits, Space toggles the
-  selected file's staging state, Cmd+,/Ctrl+, opens Settings, and Escape
-  closes any open panel.
-
-Commit creation, real Git operations, text editing, search, and persistence
-are deferred. Patch snippets and change totals are illustrative fixtures, not
-computed Git output.
+- **History:** every branch keeps its own colored rail. Lanes are derived from
+  the commit graph, not stored on a commit, so the layout follows real
+  topology. Merge commits use a hollow inner dot.
+- **Columns:** COMMIT, BRANCH, AUTHOR, MESSAGE, and WHEN are fixed widths, so
+  every row lines up, and the table scrolls sideways. **Columns** hides or
+  shows any column except the message.
+- **Branches:** the history shows every ref by default. **Branches** narrows it
+  to as many as five, which is what the graph can label clearly.
+- **Changes:** the right sidebar lists what Git reports as changed and staged.
+  The `+` and `−` on a row stage and unstage that path for real, and the
+  header buttons stage or unstage everything.
+- **Committing:** select the message box, type, and select Commit. The message
+  field is a minimal input, so it handles typing and backspace and nothing
+  more.
+- **Diffs:** selecting a change opens `git diff` for that path, with line
+  numbers following the new side of each hunk. Selecting a file under FILES
+  opens its current contents in a tab.
+- **Refresh:** `↻` in the history header re-reads the repository. Every write
+  reloads on its own.
+- **Appearance:** the gear at the bottom of the activity bar chooses Dark or
+  Light for the running session.
+- **Shortcuts:** Up/Down moves through the history, Cmd+1/Ctrl+1 opens the
+  selected change as a diff, Cmd+2/Ctrl+2 focuses a source tab, Cmd+,/Ctrl+,
+  opens Settings, and Escape closes any open panel.
 
 ## Structure
 
@@ -93,9 +86,13 @@ Destructive operations are named plainly and kept separate: `reset` with
 `ResetMode::is_destructive` exists so callers can gate them behind a
 confirmation before any of this reaches a button.
 
-None of these operations are wired to the interface yet. They are covered by
-integration tests that build throwaway repositories, including fetch and push
-against a local bare repository, so the tests need no network access.
+Staging, unstaging, and committing are wired to the interface. Fetch, pull,
+push, branch switching, and the destructive operations are implemented and
+tested but deliberately not reachable from a control yet.
+
+The Git layer is covered by integration tests that build throwaway
+repositories, including fetch and push against a local bare repository, so the
+tests need no network access.
 
 Lanes are not stored on a commit. `graph::rows` derives them from the current
 branch selection, which is what lets the gutter show five of eight branches

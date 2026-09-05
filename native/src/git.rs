@@ -273,6 +273,44 @@ impl Repository {
         Ok(parse_log(&raw))
     }
 
+    /// The most recent `limit` commits reachable from `refs`.
+    ///
+    /// An empty `refs` walks every ref, which is what the history shows before
+    /// a branch selection narrows it.
+    pub fn log_refs(&self, refs: &[&str], limit: usize) -> Result<Vec<Commit>> {
+        if self.head_id()?.is_none() {
+            return Ok(Vec::new());
+        }
+        let limit = format!("--max-count={limit}");
+        let format = format!(
+            "--pretty=format:%H{FIELD}%h{FIELD}%P{FIELD}%an{FIELD}%ae{FIELD}%at{FIELD}%ar{FIELD}%D{FIELD}%s{RECORD}"
+        );
+        let mut args = vec!["log", "--topo-order", &limit, &format];
+        if refs.is_empty() {
+            args.push("--all");
+        } else {
+            // `--` keeps a branch named like a path from being read as one.
+            args.extend(refs.iter().copied());
+            args.push("--");
+        }
+        Ok(parse_log(&self.run(&args)?))
+    }
+
+    /// Every file tracked in the index, in Git's own sorted order.
+    pub fn tracked_files(&self) -> Result<Vec<String>> {
+        Ok(self
+            .run(&["ls-files", "-z"])?
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Reads a file from the working tree.
+    pub fn read_working_file(&self, path: &str) -> std::io::Result<String> {
+        std::fs::read_to_string(self.root.join(path))
+    }
+
     /// Every local branch, remote-tracking branch, and tag.
     pub fn references(&self) -> Result<Vec<Reference>> {
         let format = format!("--format=%(refname){FIELD}%(objectname)");
@@ -1276,6 +1314,75 @@ mod tests {
     }
 
     // ---- Parsers, without a repository ---------------------------------
+
+    #[test]
+    fn log_refs_narrows_the_history_to_the_given_branches() {
+        let temp = TempRepo::new("logrefs");
+        temp.commit_file("base.txt", "base\n", "Base");
+        temp.git(&["switch", "--create", "side"]);
+        temp.commit_file("side.txt", "side\n", "Only on side");
+        temp.git(&["switch", "main"]);
+        temp.commit_file("main.txt", "main\n", "Only on main");
+        let repo = temp.open();
+
+        let everything: Vec<String> = repo
+            .log_refs(&[], 50)
+            .expect("log")
+            .into_iter()
+            .map(|c| c.subject)
+            .collect();
+        assert!(everything.contains(&"Only on side".to_string()));
+        assert!(everything.contains(&"Only on main".to_string()));
+
+        let only_main: Vec<String> = repo
+            .log_refs(&["main"], 50)
+            .expect("log")
+            .into_iter()
+            .map(|c| c.subject)
+            .collect();
+        assert!(only_main.contains(&"Only on main".to_string()));
+        assert!(
+            !only_main.contains(&"Only on side".to_string()),
+            "the side branch leaked into a main-only log"
+        );
+        assert!(
+            only_main.contains(&"Base".to_string()),
+            "shared history is kept"
+        );
+    }
+
+    #[test]
+    fn tracked_files_lists_the_index_and_skips_untracked_paths() {
+        let temp = TempRepo::new("lsfiles");
+        temp.commit_file("src/main.rs", "fn main() {}\n", "Initial commit");
+        temp.commit_file("docs/readme.md", "# hi\n", "Docs");
+        temp.write("untracked.txt", "loose\n");
+
+        let files = temp.open().tracked_files().expect("ls-files");
+        assert!(files.contains(&"src/main.rs".to_string()), "{files:?}");
+        assert!(files.contains(&"docs/readme.md".to_string()), "{files:?}");
+        assert!(!files.contains(&"untracked.txt".to_string()), "{files:?}");
+    }
+
+    #[test]
+    fn reading_a_working_file_returns_its_current_contents() {
+        let temp = TempRepo::new("readfile");
+        temp.commit_file("a.txt", "committed\n", "Initial commit");
+        temp.write("a.txt", "edited\n");
+        let repo = temp.open();
+        assert_eq!(repo.read_working_file("a.txt").expect("read"), "edited\n");
+        assert!(repo.read_working_file("missing.txt").is_err());
+    }
+
+    #[test]
+    fn a_diff_shows_the_working_tree_change() {
+        let temp = TempRepo::new("diff");
+        temp.commit_file("a.txt", "one\n", "Initial commit");
+        temp.write("a.txt", "two\n");
+        let diff = temp.open().diff("a.txt", false).expect("diff");
+        assert!(diff.contains("-one"), "{diff}");
+        assert!(diff.contains("+two"), "{diff}");
+    }
 
     #[test]
     fn the_status_parser_reads_branch_headers() {
