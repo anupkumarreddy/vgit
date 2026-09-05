@@ -53,7 +53,7 @@ The local bundle is unsigned and intended for development only.
 | Title bar | **Open** another repository, **Fetch**, **Pull** (fast-forward only), **Push**, and `⋯` for repository actions |
 | Left sidebar, top | The history, with `↻` refresh, **Branches**, and **Columns** |
 | Left sidebar, bottom | The selected commit, its actions, and the stash |
-| Centre, bottom | Changes, staged changes, and the commit message |
+| Centre, bottom | Changes on the left; staged changes above the commit message on the right |
 | Right sidebar | Source control state, refs, and the source file tree |
 | Change rows | `+`/`−` stage and unstage, `⟲` discards that file |
 

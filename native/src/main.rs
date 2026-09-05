@@ -75,8 +75,9 @@ const COLUMNS: &[Column] = &[
     Column::Commit,
     Column::Branch,
     Column::Author,
-    Column::Message,
     Column::When,
+    // The message is widest and least aligned, so it ends the row.
+    Column::Message,
 ];
 
 impl Column {
@@ -2077,7 +2078,9 @@ impl Workspace {
         };
 
         row()
-            .h(px(210.))
+            // Tall enough for the staged list and the commit box stacked
+            // beneath it without either collapsing.
+            .h(px(264.))
             .flex_none()
             .border_t_1()
             .border_color(rgb(colors.line))
@@ -2091,64 +2094,69 @@ impl Workspace {
                     this.stage_all(cx);
                 })),
             ))
-            .child(self.change_column(
-                "dock-staged",
-                format!("STAGED  {staged_count}"),
-                staged_rows,
-                "Nothing is staged.",
-                bulk("unstage-all", "−").on_click(cx.listener(|this, _, _, cx| {
-                    this.unstage_all(cx);
-                })),
-            ))
             .child(
                 column()
-                    .w(px(300.))
-                    .flex_none()
+                    .flex_1()
+                    .min_w_0()
                     .min_h_0()
-                    .child(
-                        row()
-                            .h(px(26.))
-                            .flex_none()
-                            .px_3()
-                            .bg(rgb(colors.editor_alt))
-                            .border_b_1()
-                            .border_color(rgb(colors.line))
-                            .child(section_label(colors, "COMMIT")),
-                    )
+                    .child(self.change_column(
+                        "dock-staged",
+                        format!("STAGED  {staged_count}"),
+                        staged_rows,
+                        "Nothing is staged.",
+                        bulk("unstage-all", "−").on_click(cx.listener(|this, _, _, cx| {
+                            this.unstage_all(cx);
+                        })),
+                    ))
                     .child(
                         column()
-                            .flex_1()
-                            .min_h_0()
-                            .p_2()
-                            .gap_2()
-                            .child(self.text_field(Field::CommitMessage, cx))
+                            .flex_none()
+                            .border_t_1()
+                            .border_color(rgb(colors.line))
                             .child(
                                 row()
-                                    .id("commit-button")
-                                    .h(px(28.))
+                                    .h(px(26.))
                                     .flex_none()
-                                    .justify_center()
-                                    .rounded(px(4.))
-                                    .bg(rgb(if staged_count == 0 {
-                                        colors.line_strong
-                                    } else {
-                                        colors.local
-                                    }))
-                                    .text_color(rgb(colors.editor))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_size(px(13.))
-                                    .when(staged_count > 0, |this| {
-                                        this.cursor_pointer().on_click(cx.listener(
-                                            |this, _, _, cx| {
-                                                this.commit_staged(cx);
-                                            },
-                                        ))
-                                    })
-                                    .child(if staged_count == 0 {
-                                        "Stage a change to commit".to_string()
-                                    } else {
-                                        format!("Commit {staged_count} change(s)")
-                                    }),
+                                    .px_3()
+                                    .bg(rgb(colors.editor_alt))
+                                    .border_b_1()
+                                    .border_color(rgb(colors.line))
+                                    .child(section_label(colors, "COMMIT MESSAGE")),
+                            )
+                            .child(
+                                column()
+                                    .flex_none()
+                                    .p_2()
+                                    .gap_2()
+                                    .child(self.text_field(Field::CommitMessage, cx))
+                                    .child(
+                                        row()
+                                            .id("commit-button")
+                                            .h(px(28.))
+                                            .flex_none()
+                                            .justify_center()
+                                            .rounded(px(4.))
+                                            .bg(rgb(if staged_count == 0 {
+                                                colors.line_strong
+                                            } else {
+                                                colors.local
+                                            }))
+                                            .text_color(rgb(colors.editor))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(px(13.))
+                                            .when(staged_count > 0, |this| {
+                                                this.cursor_pointer().on_click(cx.listener(
+                                                    |this, _, _, cx| {
+                                                        this.commit_staged(cx);
+                                                    },
+                                                ))
+                                            })
+                                            .child(if staged_count == 0 {
+                                                "Stage a change to commit".to_string()
+                                            } else {
+                                                format!("Commit {staged_count} change(s)")
+                                            }),
+                                    ),
                             ),
                     ),
             )
