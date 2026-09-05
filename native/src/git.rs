@@ -520,6 +520,28 @@ impl Repository {
         self.run_unit(&args)
     }
 
+    /// Stashes only the given paths, leaving everything else in place.
+    pub fn stash_paths(
+        &self,
+        message: &str,
+        paths: &[&str],
+        include_untracked: bool,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["stash", "push"];
+        if include_untracked {
+            args.push("--include-untracked");
+        }
+        args.push("--message");
+        args.push(message);
+        // Everything after `--` is a path, never an option or a revision.
+        args.push("--");
+        args.extend_from_slice(paths);
+        self.run_unit(&args)
+    }
+
     pub fn stash_pop(&self) -> Result<()> {
         self.run_unit(&["stash", "pop"])
     }
@@ -1740,6 +1762,47 @@ mod tests {
         assert_eq!(stashes[0].message, "tidy up");
         assert_eq!(stashes[1].message, "1234 subject");
         assert_eq!(stashes[1].reference, "stash@{1}");
+    }
+
+    #[test]
+    fn stashing_selected_paths_leaves_the_others_alone() {
+        let temp = TempRepo::new("stash-paths");
+        temp.commit_file("kept.txt", "original\n", "Initial commit");
+        temp.commit_file("taken.txt", "original\n", "Second commit");
+        temp.write("kept.txt", "still edited\n");
+        temp.write("taken.txt", "stashed away\n");
+        let repo = temp.open();
+
+        repo.stash_paths("just one", &["taken.txt"], false)
+            .expect("stash paths");
+
+        assert_eq!(
+            temp.read("taken.txt"),
+            "original\n",
+            "the chosen path reverted"
+        );
+        assert_eq!(
+            temp.read("kept.txt"),
+            "still edited\n",
+            "the other path survived"
+        );
+        assert_eq!(repo.stash_list().expect("list").len(), 1);
+
+        repo.stash_pop().expect("pop");
+        assert_eq!(temp.read("taken.txt"), "stashed away\n");
+    }
+
+    #[test]
+    fn stashing_an_empty_selection_does_nothing() {
+        let temp = TempRepo::new("stash-none");
+        temp.commit_file("a.txt", "a\n", "Initial commit");
+        temp.write("a.txt", "edited\n");
+        let repo = temp.open();
+
+        repo.stash_paths("nothing", &[], false).expect("no-op");
+
+        assert!(repo.stash_list().expect("list").is_empty());
+        assert_eq!(temp.read("a.txt"), "edited\n");
     }
 
     #[test]

@@ -44,6 +44,12 @@ state, because an unsuccessful revert or stash operation can leave conflicts.
 Read generations reject obsolete completions, and refresh reloads every open
 editor tab. Commit selection follows its object ID across history updates.
 
+Each change row carries a tick box. Section headers act on the ticked rows,
+or on the whole section when nothing is ticked, so staging, stashing, and
+discarding all take a selection. Ticks are held by path and ignored outside
+the section acting on them, so selecting a staged file cannot widen a discard
+in the changes list.
+
 Partially staged files appear in both change sections. Each row opens and
 operates on its own index or working-tree version. Untracked text has an
 additions preview; binary files have an explicit marker. Unstaging also works

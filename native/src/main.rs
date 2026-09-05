@@ -262,6 +262,9 @@ struct Workspace {
     sources: HashMap<String, String>,
     /// Directories collapsed in the source tree, by path.
     collapsed: HashSet<String>,
+    /// Paths ticked in the change lists. Selection is by path, so a partially
+    /// staged file is the same selection in both sections.
+    picked: HashSet<String>,
     /// Branches drawn in the graph, at most [`graph::LANE_CAPACITY`] of them.
     /// Empty means every ref.
     visible_branches: Vec<String>,
@@ -339,6 +342,21 @@ fn load(
         stashes: repository.stash_list().unwrap_or_default(),
         tree: build_tree(&repository.tracked_files().unwrap_or_default()),
     })
+}
+
+/// The paths a bulk action acts on.
+///
+/// Ticking nothing means "everything in this section", which is what makes the
+/// header buttons work without a selection. Ticking anything narrows the action
+/// to exactly those paths, and ticks outside this section are ignored, so
+/// selecting a staged file cannot widen a discard in the changes list.
+fn pick_targets(section: Vec<String>, picked: &HashSet<String>) -> Vec<String> {
+    let chosen: Vec<String> = section
+        .iter()
+        .filter(|path| picked.contains(*path))
+        .cloned()
+        .collect();
+    if chosen.is_empty() { section } else { chosen }
 }
 
 /// Clamps a dragged sidebar width to what `viewport` can spare while leaving
@@ -421,6 +439,7 @@ impl Workspace {
             diffs: HashMap::new(),
             sources: HashMap::new(),
             collapsed: HashSet::new(),
+            picked: HashSet::new(),
             visible_branches: Vec::new(),
             hidden_columns: HashSet::new(),
             sidebar_width: SIDEBAR_DEFAULT,
@@ -1277,27 +1296,133 @@ impl Workspace {
         task.detach();
     }
 
-    fn stage_all(&mut self, cx: &mut Context<Self>) {
+    fn toggle_pick(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.picked.remove(&path) {
+            self.picked.insert(path);
+        }
+        cx.notify();
+    }
+
+    /// The paths a bulk action should act on: the ticked ones, or every path
+    /// in that section when nothing is ticked.
+    fn targets(&self, staged: bool) -> Vec<String> {
+        let all: Vec<String> = self
+            .changes()
+            .into_iter()
+            .filter(|file| {
+                if staged {
+                    file.is_staged()
+                } else {
+                    file.is_modified()
+                }
+            })
+            .map(|file| file.path)
+            .collect();
+        pick_targets(all, &self.picked)
+    }
+
+    /// How many ticked paths are in one section, for the header count.
+    fn picked_in(&self, staged: bool) -> usize {
+        self.changes()
+            .iter()
+            .filter(|file| {
+                if staged {
+                    file.is_staged()
+                } else {
+                    file.is_modified()
+                }
+            })
+            .filter(|file| self.picked.contains(&file.path))
+            .count()
+    }
+
+    fn stage_picked(&mut self, cx: &mut Context<Self>) {
+        let paths = self.targets(false);
+        if paths.is_empty() {
+            return;
+        }
+        self.picked.clear();
         self.perform(
-            "Staged every change".into(),
-            |repository| repository.stage_all(),
+            format!("Staged {} path(s)", paths.len()),
+            move |repository| {
+                let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+                repository.stage(&borrowed)
+            },
             cx,
         );
     }
 
-    fn unstage_all(&mut self, cx: &mut Context<Self>) {
-        let paths: Vec<String> = self
-            .data()
-            .map(|data| data.status.staged().map(|f| f.path.clone()).collect())
-            .unwrap_or_default();
+    fn unstage_picked(&mut self, cx: &mut Context<Self>) {
+        let paths = self.targets(true);
         if paths.is_empty() {
             return;
         }
+        self.picked.clear();
         self.perform(
-            "Unstaged every change".into(),
+            format!("Unstaged {} path(s)", paths.len()),
             move |repository| {
                 let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
                 repository.unstage(&borrowed)
+            },
+            cx,
+        );
+    }
+
+    /// Stashes the ticked paths, or everything changed when none are ticked.
+    fn stash_picked(&mut self, cx: &mut Context<Self>) {
+        let paths = self.targets(false);
+        if paths.is_empty() {
+            self.message = "There is nothing to stash".into();
+            cx.notify();
+            return;
+        }
+        let typed = self.input(Field::StashMessage).trim().to_string();
+        let message = if typed.is_empty() {
+            format!("VGit: {} path(s)", paths.len())
+        } else {
+            typed
+        };
+        self.inputs.remove(&Field::StashMessage);
+        self.picked.clear();
+        self.perform(
+            format!("Stashed {} path(s)", paths.len()),
+            move |repository| {
+                let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+                repository.stash_paths(&message, &borrowed, true)
+            },
+            cx,
+        );
+    }
+
+    /// Throws away the ticked paths' working-tree changes. Destructive.
+    fn discard_picked(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<String> = self
+            .targets(false)
+            .into_iter()
+            .filter(|path| {
+                // Untracked files are not Git's to restore; Clean removes those.
+                !self
+                    .changes()
+                    .iter()
+                    .any(|file| &file.path == path && file.untracked)
+            })
+            .collect();
+        if paths.is_empty() {
+            self.message = "Nothing tracked is selected; use Clean for untracked files".into();
+            cx.notify();
+            return;
+        }
+        let count = paths.len();
+        self.picked.clear();
+        self.ask(
+            format!("Discard changes to {count} path(s)?"),
+            "Throws away every uncommitted change to those files. This cannot be \
+             undone through Git."
+                .to_string(),
+            format!("Discarded {count} path(s)"),
+            move |repository| {
+                let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+                repository.discard(&borrowed)
             },
             cx,
         );
@@ -2004,7 +2129,7 @@ impl Workspace {
         title: String,
         rows: Vec<AnyElement>,
         empty: &'static str,
-        control: impl IntoElement,
+        controls: impl IntoElement,
     ) -> impl IntoElement {
         let colors = self.colors();
         column()
@@ -2023,7 +2148,7 @@ impl Workspace {
                     .border_color(rgb(colors.line))
                     .child(section_label(colors, title))
                     .child(div().flex_1())
-                    .child(control),
+                    .child(controls),
             )
             .child(
                 column()
@@ -2052,6 +2177,8 @@ impl Workspace {
         let files = self.changes();
         let staged_count = files.iter().filter(|file| file.is_staged()).count();
         let changed_count = files.iter().filter(|file| file.is_modified()).count();
+        let picked_changed = self.picked_in(false);
+        let picked_staged = self.picked_in(true);
         let changed_rows = files
             .iter()
             .enumerate()
@@ -2084,24 +2211,60 @@ impl Workspace {
             .border_t_1()
             .border_color(rgb(colors.line))
             .bg(rgb(colors.panel))
-            .child(self.change_column(
-                "dock-changes",
-                format!("CHANGES  {changed_count}"),
-                changed_rows,
-                "The working tree is clean.",
-                bulk("stage-all", "＋").on_click(cx.listener(|this, _, _, cx| {
-                    this.stage_all(cx);
-                })),
-            ))
-            .child(self.change_column(
-                "dock-staged",
-                format!("STAGED  {staged_count}"),
-                staged_rows,
-                "Nothing is staged.",
-                bulk("unstage-all", "−").on_click(cx.listener(|this, _, _, cx| {
-                    this.unstage_all(cx);
-                })),
-            ))
+            .child(
+                self.change_column(
+                    "dock-changes",
+                    match picked_changed {
+                        0 => format!("CHANGES  {changed_count}"),
+                        n => format!("CHANGES  {n} of {changed_count} selected"),
+                    },
+                    changed_rows,
+                    "The working tree is clean.",
+                    row()
+                        .gap_1()
+                        .child(bulk("discard-picked", "⟲").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.discard_picked(cx);
+                            },
+                        )))
+                        .child(
+                            bulk("stash-picked", "↓").on_click(cx.listener(|this, _, _, cx| {
+                                this.stash_picked(cx);
+                            })),
+                        )
+                        .child(bulk("stage-picked", "＋").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.stage_picked(cx);
+                            },
+                        ))),
+                ),
+            )
+            .child(
+                self.change_column(
+                    "dock-staged",
+                    match picked_staged {
+                        0 => format!("STAGED  {staged_count}"),
+                        n => format!("STAGED  {n} of {staged_count} selected"),
+                    },
+                    staged_rows,
+                    "Nothing is staged.",
+                    row()
+                        .gap_1()
+                        .when(!self.picked.is_empty(), |this| {
+                            this.child(bulk("clear-picks", "×").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.picked.clear();
+                                    cx.notify();
+                                },
+                            )))
+                        })
+                        .child(bulk("unstage-picked", "−").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.unstage_picked(cx);
+                            },
+                        ))),
+                ),
+            )
             .child(
                 column()
                     .flex_none()
@@ -2241,6 +2404,24 @@ impl Workspace {
                 colors.panel
             }))
             .hover(move |this| this.bg(rgb(colors.hover)))
+            .child({
+                let path = file.path.clone();
+                let ticked = self.picked.contains(&file.path);
+                div()
+                    .id(("pick-file", index))
+                    .w(px(15.))
+                    .flex_none()
+                    .text_size(px(12.))
+                    .text_color(rgb(if ticked { colors.local } else { colors.dim }))
+                    .cursor_pointer()
+                    .hover(move |this| this.text_color(rgb(colors.text_bright)))
+                    .child(if ticked { "■" } else { "□" })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Ticking a row must not also open it in the editor.
+                        cx.stop_propagation();
+                        this.toggle_pick(path.clone(), cx);
+                    }))
+            })
             .child(
                 div()
                     .w(px(13.))
@@ -2976,7 +3157,13 @@ impl Workspace {
                     .child(
                         self.action_button("stash-push", "↓", "Stash", dirty, false)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.stash(cx);
+                                this.stash_picked(cx);
+                            })),
+                    )
+                    .child(
+                        self.action_button("stash-pop", "↑", "Pop", !stashes.is_empty(), false)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stash_pop(cx);
                             })),
                     ),
             )
@@ -3725,6 +3912,61 @@ mod tests {
         assert_eq!(hunk_start("   context"), None);
         assert_eq!(hunk_start(""), None);
         assert_eq!(hunk_start("@@ malformed"), None);
+    }
+
+    // ---- Bulk selection --------------------------------------------------
+
+    fn paths(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn picks(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// No ticks means the action covers the whole section.
+    #[test]
+    fn an_empty_selection_targets_the_whole_section() {
+        let section = paths(&["a.rs", "b.rs", "c.rs"]);
+        assert_eq!(pick_targets(section.clone(), &HashSet::new()), section);
+    }
+
+    #[test]
+    fn ticks_narrow_the_action_to_those_paths() {
+        let section = paths(&["a.rs", "b.rs", "c.rs"]);
+        let chosen = pick_targets(section, &picks(&["a.rs", "c.rs"]));
+        assert_eq!(chosen, paths(&["a.rs", "c.rs"]));
+    }
+
+    /// A tick belonging to the other section must not widen this one. Without
+    /// this, ticking a staged file could pull an extra path into a discard.
+    #[test]
+    fn ticks_outside_the_section_are_ignored() {
+        let section = paths(&["a.rs", "b.rs"]);
+        let chosen = pick_targets(section.clone(), &picks(&["elsewhere.rs"]));
+        assert_eq!(
+            chosen, section,
+            "an unrelated tick must not narrow anything"
+        );
+
+        let chosen = pick_targets(section, &picks(&["b.rs", "elsewhere.rs"]));
+        assert_eq!(
+            chosen,
+            paths(&["b.rs"]),
+            "only paths in the section survive"
+        );
+    }
+
+    #[test]
+    fn selection_order_follows_the_section_not_the_ticks() {
+        let section = paths(&["a.rs", "b.rs", "c.rs"]);
+        let chosen = pick_targets(section, &picks(&["c.rs", "a.rs"]));
+        assert_eq!(chosen, paths(&["a.rs", "c.rs"]));
+    }
+
+    #[test]
+    fn an_empty_section_stays_empty() {
+        assert!(pick_targets(Vec::new(), &picks(&["a.rs"])).is_empty());
     }
 
     /// Every column has a distinct label, so the picker is unambiguous.

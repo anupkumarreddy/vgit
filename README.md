@@ -55,7 +55,8 @@ The local bundle is unsigned and intended for development only.
 | Left sidebar, bottom | The selected commit, its actions, and the stash |
 | Centre, bottom | Changes, staged changes, and the commit message, stacked |
 | Right sidebar | Source control state, refs, and the source file tree |
-| Change rows | `+`/`−` stage and unstage, `⟲` discards that file |
+| Change rows | tick a row to select it; `+`/`−` stage and unstage, `⟲` discards that file |
+| Section headers | act on the ticked rows, or on the whole section when nothing is ticked |
 
 The commit actions sit under the history: check out, revert, reset soft,
 reset mixed, reset hard, and amend. Each enables only when Git would accept
