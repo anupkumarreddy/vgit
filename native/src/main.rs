@@ -165,6 +165,19 @@ fn clamp_sidebar_width(stored: f32, viewport: f32) -> f32 {
     stored.min(available.max(SIDEBAR_MIN))
 }
 
+/// Which tab becomes active after the tab at `closed` is removed, given the
+/// number of tabs `remaining` afterwards.
+fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
+    if closed < active {
+        active - 1
+    } else if closed == active {
+        // Hold the position, or fall back to the new last tab.
+        active.min(remaining.saturating_sub(1))
+    } else {
+        active
+    }
+}
+
 /// One fixed-width cell of the history table.
 fn cell(width: f32) -> Div {
     row().w(px(width)).flex_none().pr(px(10.)).overflow_hidden()
@@ -240,6 +253,11 @@ impl Workspace {
         self.theme.palette()
     }
 
+    /// The open tab, clamped so a stale index can never panic the renderer.
+    fn active_tab(&self) -> Tab {
+        self.tabs[self.active_tab.min(self.tabs.len() - 1)]
+    }
+
     /// The sidebar width to actually paint. The stored width is what the user
     /// dragged to; this additionally clamps it to whatever the current window
     /// can spare while leaving the editor at least [`EDITOR_MIN`]. Narrowing
@@ -284,9 +302,7 @@ impl Workspace {
             return;
         }
         self.tabs.remove(index);
-        if self.active_tab > index || self.active_tab == self.tabs.len() {
-            self.active_tab -= 1;
-        }
+        self.active_tab = active_after_close(self.active_tab, index, self.tabs.len());
         cx.notify();
     }
 
@@ -802,6 +818,10 @@ impl Workspace {
                             })
                             .child("\u{00d7}")
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                // Without this the click also reaches the tab
+                                // row behind it, which would then activate the
+                                // index that was just removed.
+                                cx.stop_propagation();
                                 this.close_tab(index, cx);
                             })),
                     )
@@ -826,7 +846,7 @@ impl Workspace {
 
     fn breadcrumb(&self) -> impl IntoElement {
         let colors = self.colors();
-        let path = match self.tabs[self.active_tab] {
+        let path = match self.active_tab() {
             Tab::Diff { file } => self.files[file].path,
             Tab::Source { path } => path,
         };
@@ -849,7 +869,7 @@ impl Workspace {
                 elements
             }))
             .child(div().text_color(rgb(colors.dim)).child("›"))
-            .child(match self.tabs[self.active_tab] {
+            .child(match self.active_tab() {
                 Tab::Diff { .. } => "Working Tree",
                 Tab::Source { .. } => "Source",
             })
@@ -984,7 +1004,7 @@ impl Workspace {
             .bg(rgb(colors.editor))
             .child(self.editor_tabs(cx))
             .child(self.breadcrumb())
-            .child(match self.tabs[self.active_tab] {
+            .child(match self.active_tab() {
                 Tab::Diff { file } => self.diff_editor(file).into_any_element(),
                 Tab::Source { path } => self.source_editor(path).into_any_element(),
             })
@@ -1051,6 +1071,8 @@ impl Workspace {
                     .cursor_pointer()
                     .child(if staged { "−" } else { "+" })
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        // Staging a file should not also open it in the editor.
+                        cx.stop_propagation();
                         this.toggle_stage(index, cx);
                     })),
             )
@@ -1210,7 +1232,7 @@ impl Workspace {
             .filter(|(_, file)| file.staged)
             .map(|(index, _)| self.file_row(index, true, cx).into_any_element())
             .collect::<Vec<_>>();
-        let open_source = match self.tabs[self.active_tab] {
+        let open_source = match self.active_tab() {
             Tab::Source { path } => Some(path),
             Tab::Diff { .. } => None,
         };
@@ -1890,6 +1912,42 @@ mod tests {
     fn only_the_message_column_is_permanent() {
         let fixed: Vec<_> = COLUMNS.iter().filter(|c| !c.hideable()).collect();
         assert_eq!(fixed, vec![&Column::Message]);
+    }
+
+    /// Closing a tab must always leave a valid active index. This is the
+    /// arithmetic behind the crash where closing a tab left `active_tab`
+    /// pointing one past the end of the list.
+    #[test]
+    fn closing_a_tab_always_leaves_a_valid_active_index() {
+        for total in 2..6usize {
+            for active in 0..total {
+                for closed in 0..total {
+                    let remaining = total - 1;
+                    let next = active_after_close(active, closed, remaining);
+                    assert!(
+                        next < remaining,
+                        "closing {closed} of {total} with {active} active gave {next}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn closing_an_earlier_tab_keeps_the_same_tab_active() {
+        // Tabs [a, b, c] with c active; closing a leaves c active at index 1.
+        assert_eq!(active_after_close(2, 0, 2), 1);
+        // Closing a later tab does not move the selection.
+        assert_eq!(active_after_close(0, 1, 2), 0);
+    }
+
+    #[test]
+    fn closing_the_active_tab_falls_back_within_the_list() {
+        // Closing the last tab while it is active steps back one.
+        assert_eq!(active_after_close(2, 2, 2), 1);
+        // Closing an active tab in the middle holds the position.
+        assert_eq!(active_after_close(1, 1, 3), 1);
+        assert_eq!(active_after_close(1, 1, 2), 1);
     }
 
     /// Every column has a distinct label, so the picker is unambiguous.
