@@ -101,11 +101,15 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// A distinct rail color per lane, for as many lanes as the graph gutter
+    /// reserves room for.
     pub fn branch(self, lane: usize) -> u32 {
         match lane {
             0 => self.local,
             1 => self.remote,
-            _ => self.tag,
+            2 => self.tag,
+            3 => self.merge,
+            _ => self.red,
         }
     }
 }

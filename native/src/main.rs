@@ -34,10 +34,35 @@ enum Tab {
     Source { path: &'static str },
 }
 
-/// Drag bounds and starting width for the history sidebar.
+/// Widths of the fixed chrome around the editor, and the narrowest the editor
+/// itself is allowed to become.
+const ACTIVITY_WIDTH: f32 = 46.;
+const RESIZER_WIDTH: f32 = 5.;
+const RIGHT_SIDEBAR_WIDTH: f32 = 320.;
+const EDITOR_MIN: f32 = 320.;
+
+/// Drag bounds for the history sidebar. It opens at its full width.
 const SIDEBAR_MIN: f32 = 280.;
 const SIDEBAR_MAX: f32 = 760.;
-const SIDEBAR_DEFAULT: f32 = 480.;
+const SIDEBAR_DEFAULT: f32 = SIDEBAR_MAX;
+
+/// Fixed column widths for the history table. Every cell is the same width on
+/// every row, so the hashes, branches, refs, and messages line up as columns.
+const COL_HASH: f32 = 78.;
+const COL_BRANCH: f32 = 136.;
+const COL_REF: f32 = 116.;
+const COL_MESSAGE: f32 = 430.;
+const COL_TIME: f32 = 70.;
+
+/// Total width of one history row. This is wider than the sidebar can be
+/// dragged, so the table carries its own horizontal scroller.
+const ROW_WIDTH: f32 =
+    graph::GRAPH_WIDTH + COL_HASH + COL_BRANCH + COL_REF + COL_MESSAGE + COL_TIME;
+
+// The table must stay wider than the sidebar, or the horizontal scroller the
+// message column depends on would have nothing to scroll.
+const _: () = assert!(ROW_WIDTH > SIDEBAR_MAX);
+const _: () = assert!(SIDEBAR_DEFAULT >= SIDEBAR_MIN && SIDEBAR_DEFAULT <= SIDEBAR_MAX);
 
 /// Editor typography. A single monospace measure is shared by the diff and
 /// source views so both line up column for column, with the ~1.55 line height
@@ -87,6 +112,22 @@ fn button(
         .hover(move |this| this.bg(rgb(colors.hover)))
         .active(|this| this.opacity(0.8))
         .child(text.into())
+}
+
+/// Clamps a dragged sidebar width to what `viewport` can spare while leaving
+/// the editor at least [`EDITOR_MIN`].
+fn clamp_sidebar_width(stored: f32, viewport: f32) -> f32 {
+    let available = viewport - ACTIVITY_WIDTH - RESIZER_WIDTH - RIGHT_SIDEBAR_WIDTH - EDITOR_MIN;
+    stored.min(available.max(SIDEBAR_MIN))
+}
+
+/// One fixed-width cell of the history table.
+fn cell(width: f32) -> Div {
+    row().w(px(width)).flex_none().pr(px(10.)).overflow_hidden()
+}
+
+fn header_cell(colors: Palette, width: f32, label: &'static str) -> Div {
+    cell(width).child(section_label(colors, label))
 }
 
 fn icon_button(
@@ -147,6 +188,15 @@ impl Workspace {
 
     fn colors(&self) -> Palette {
         self.theme.palette()
+    }
+
+    /// The sidebar width to actually paint. The stored width is what the user
+    /// dragged to; this additionally clamps it to whatever the current window
+    /// can spare while leaving the editor at least [`EDITOR_MIN`]. Narrowing
+    /// the window squeezes the sidebar instead of pushing the right sidebar
+    /// off-screen, and widening it again restores the dragged width.
+    fn painted_sidebar_width(&self, window: &Window) -> f32 {
+        clamp_sidebar_width(self.sidebar_width, f32::from(window.viewport_size().width))
     }
 
     fn select_commit(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -289,7 +339,7 @@ impl Workspace {
     fn activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         column()
-            .w(px(46.))
+            .w(px(ACTIVITY_WIDTH))
             .flex_none()
             .h_full()
             .items_center()
@@ -319,7 +369,7 @@ impl Workspace {
         let dragging = self.resize_origin.is_some();
         div()
             .id("sidebar-resizer")
-            .w(px(5.))
+            .w(px(RESIZER_WIDTH))
             .flex_none()
             .h_full()
             .cursor_col_resize()
@@ -334,10 +384,10 @@ impl Workspace {
             )
     }
 
-    fn graph_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn graph_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         column()
-            .w(px(self.sidebar_width))
+            .w(px(width))
             .flex_none()
             .h_full()
             .min_h_0()
@@ -376,87 +426,111 @@ impl Workspace {
                     ),
             )
             .child(
-                row()
-                    .h(px(28.))
-                    .flex_none()
-                    .px_3()
-                    .border_y_1()
-                    .border_color(rgb(colors.line))
-                    .child(section_label(colors, "GRAPH & COMMIT"))
-                    .child(div().flex_1())
-                    .child(section_label(colors, "WHEN")),
-            )
-            .child(
-                column()
-                    .id("graph-history")
-                    .track_scroll(&self.history_scroll)
+                div()
+                    .id("history-columns")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .relative()
-                    .children(COMMITS.iter().enumerate().map(|(index, commit)| {
-                        let selected = self.commit == index;
-                        let ref_color = if commit.reference.contains("origin/") {
-                            colors.remote
-                        } else if commit.reference.starts_with('v') {
-                            colors.tag
-                        } else if commit.parents.len() > 1 {
-                            colors.merge
-                        } else {
-                            colors.local
-                        };
-                        row()
-                            .id(("commit-row", index))
-                            .h(px(graph::ROW_HEIGHT))
-                            .flex_none()
-                            .pl(px(graph::GRAPH_WIDTH))
-                            .pr_2()
-                            .gap_2()
-                            .cursor_pointer()
-                            .bg(rgb(if selected {
-                                colors.selection
-                            } else {
-                                colors.sidebar
-                            }))
-                            .hover(move |this| this.bg(rgb(colors.hover)))
+                    .overflow_x_scroll()
+                    .child(
+                        column()
+                            .w(px(ROW_WIDTH))
+                            .h_full()
+                            .min_h_0()
                             .child(
-                                div()
+                                row()
+                                    .h(px(28.))
+                                    .w(px(ROW_WIDTH))
                                     .flex_none()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(colors.dim))
-                                    .child(commit.hash),
+                                    .pl(px(graph::GRAPH_WIDTH))
+                                    .border_y_1()
+                                    .border_color(rgb(colors.line))
+                                    .child(header_cell(colors, COL_HASH, "COMMIT"))
+                                    .child(header_cell(colors, COL_BRANCH, "BRANCH"))
+                                    .child(header_cell(colors, COL_REF, "REF"))
+                                    .child(header_cell(colors, COL_MESSAGE, "MESSAGE"))
+                                    .child(header_cell(colors, COL_TIME, "WHEN")),
                             )
-                            .child(badge(colors, commit.branch, colors.branch(commit.lane)))
-                            .when(!commit.reference.is_empty(), |this| {
-                                this.child(badge(colors, commit.reference, ref_color))
-                            })
                             .child(
-                                div()
+                                column()
+                                    .id("graph-history")
+                                    .track_scroll(&self.history_scroll)
                                     .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(if selected {
-                                        colors.text_bright
-                                    } else {
-                                        colors.text
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .relative()
+                                    .children(COMMITS.iter().enumerate().map(|(index, commit)| {
+                                        let selected = self.commit == index;
+                                        let ref_color = if commit.reference.contains("origin/") {
+                                            colors.remote
+                                        } else if commit.reference.starts_with('v') {
+                                            colors.tag
+                                        } else if commit.parents.len() > 1 {
+                                            colors.merge
+                                        } else {
+                                            colors.local
+                                        };
+                                        row()
+                                            .id(("commit-row", index))
+                                            .h(px(graph::ROW_HEIGHT))
+                                            .w(px(ROW_WIDTH))
+                                            .flex_none()
+                                            .pl(px(graph::GRAPH_WIDTH))
+                                            .cursor_pointer()
+                                            .bg(rgb(if selected {
+                                                colors.selection
+                                            } else {
+                                                colors.sidebar
+                                            }))
+                                            .hover(move |this| this.bg(rgb(colors.hover)))
+                                            .child(
+                                                cell(COL_HASH)
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(colors.dim))
+                                                    .child(commit.hash),
+                                            )
+                                            .child(cell(COL_BRANCH).child(badge(
+                                                colors,
+                                                commit.branch,
+                                                colors.branch(commit.lane),
+                                            )))
+                                            .child(cell(COL_REF).when(
+                                                !commit.reference.is_empty(),
+                                                |this| {
+                                                    this.child(badge(
+                                                        colors,
+                                                        commit.reference,
+                                                        ref_color,
+                                                    ))
+                                                },
+                                            ))
+                                            .child(
+                                                cell(COL_MESSAGE)
+                                                    .child(
+                                                        div()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .child(commit.subject),
+                                                    )
+                                                    .text_size(px(13.))
+                                                    .text_color(rgb(if selected {
+                                                        colors.text_bright
+                                                    } else {
+                                                        colors.text
+                                                    })),
+                                            )
+                                            .child(
+                                                cell(COL_TIME)
+                                                    .text_size(px(11.))
+                                                    .text_color(rgb(colors.dim))
+                                                    .child(commit.time),
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.select_commit(index, cx);
+                                            }))
                                     }))
-                                    .child(commit.subject),
-                            )
-                            .child(
-                                div()
-                                    .w(px(64.))
-                                    .flex_none()
-                                    .text_right()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(colors.dim))
-                                    .child(commit.time),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_commit(index, cx);
-                            }))
-                    }))
-                    .child(graph::sidebar_graph(colors)),
+                                    .child(graph::sidebar_graph(colors)),
+                            ),
+                    ),
             )
             .child(
                 column()
@@ -998,7 +1072,7 @@ impl Workspace {
             .collect::<Vec<_>>();
         column()
             .id("repository-sidebar")
-            .w(px(320.))
+            .w(px(RIGHT_SIDEBAR_WIDTH))
             .flex_none()
             .h_full()
             .min_h_0()
@@ -1256,7 +1330,7 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         column()
             .id("workspace")
@@ -1334,7 +1408,7 @@ impl Render for Workspace {
                     .min_h_0()
                     .overflow_hidden()
                     .child(self.activity_bar(cx))
-                    .child(self.graph_sidebar(cx))
+                    .child(self.graph_sidebar(self.painted_sidebar_width(window), cx))
                     .child(self.sidebar_resizer(cx))
                     .child(self.editor(cx))
                     .child(self.right_sidebar(cx)),
@@ -1368,7 +1442,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(1440.), px(900.)),
+                    size(px(1680.), px(960.)),
                     cx,
                 ))),
                 window_min_size: Some(size(px(1080.), px(700.))),
@@ -1391,4 +1465,43 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Width consumed by everything except the history sidebar.
+    fn chrome() -> f32 {
+        ACTIVITY_WIDTH + RESIZER_WIDTH + RIGHT_SIDEBAR_WIDTH
+    }
+
+    #[test]
+    fn a_roomy_window_keeps_the_dragged_width() {
+        assert_eq!(clamp_sidebar_width(SIDEBAR_DEFAULT, 1680.), SIDEBAR_DEFAULT);
+        assert_eq!(clamp_sidebar_width(420., 1680.), 420.);
+    }
+
+    /// The sidebar yields to the editor rather than pushing the repository
+    /// sidebar off the right edge.
+    #[test]
+    fn a_narrow_window_squeezes_the_sidebar_not_the_editor() {
+        for viewport in [1080., 1200., 1440., 1680.] {
+            let sidebar = clamp_sidebar_width(SIDEBAR_DEFAULT, viewport);
+            let editor = viewport - chrome() - sidebar;
+            assert!(
+                editor >= EDITOR_MIN - 0.01,
+                "at {viewport}px the editor got {editor}px"
+            );
+            assert!(
+                sidebar >= SIDEBAR_MIN - 0.01,
+                "sidebar collapsed to {sidebar}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_window_never_stretches_past_the_drag_bound() {
+        assert_eq!(clamp_sidebar_width(SIDEBAR_MAX, 4000.), SIDEBAR_MAX);
+    }
 }

@@ -2,7 +2,13 @@ use crate::{demo::COMMITS, theme::Palette};
 use gpui::{Bounds, PathBuilder, canvas, point, prelude::*, px, quad, rgb, size};
 
 pub const ROW_HEIGHT: f32 = 28.;
-pub const GRAPH_WIDTH: f32 = 94.;
+
+/// Width of the graph gutter. Sized to hold [`LANE_CAPACITY`] rails plus the
+/// radius of a node dot, so branches never paint into the commit columns.
+pub const GRAPH_WIDTH: f32 = LANE_ORIGIN + (LANE_CAPACITY - 1) as f32 * LANE_STEP + 16.;
+
+/// How many concurrent branches the gutter reserves room for.
+pub const LANE_CAPACITY: usize = 5;
 
 /// Horizontal center of the first lane, and the spacing between lanes.
 const LANE_ORIGIN: f32 = 22.;
@@ -305,6 +311,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The gutter must fit every lane it advertises, dot radius included.
+    #[test]
+    fn the_gutter_holds_its_advertised_lane_capacity() {
+        let last = LANE_ORIGIN + (LANE_CAPACITY - 1) as f32 * LANE_STEP;
+        assert!(last + 6. <= GRAPH_WIDTH, "lane {LANE_CAPACITY} overflows");
+        assert!(
+            COMMITS.iter().all(|commit| commit.lane < LANE_CAPACITY),
+            "a fixture commit sits outside the lane capacity"
+        );
     }
 
     #[test]
