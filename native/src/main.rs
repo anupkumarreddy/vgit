@@ -4,10 +4,11 @@ mod theme;
 
 use demo::{COMMITS, FileChange};
 use gpui::{
-    App, Application, Bounds, Context, Div, FocusHandle, FontWeight, KeyBinding, SharedString,
-    Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
-    rgb, size,
+    App, Application, Bounds, Context, Div, FocusHandle, FontWeight, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, SharedString, Stateful, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
+use std::collections::HashSet;
 use theme::{Palette, Theme, badge, column, row, section_label};
 
 actions!(
@@ -25,20 +26,43 @@ actions!(
     ]
 );
 
+/// One open editor tab. Diff tabs follow a changed file; source tabs are
+/// opened from the file tree and stay open until closed.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EditorView {
-    Diff,
-    Source,
+enum Tab {
+    Diff { file: usize },
+    Source { path: &'static str },
 }
+
+/// Drag bounds and starting width for the history sidebar.
+const SIDEBAR_MIN: f32 = 280.;
+const SIDEBAR_MAX: f32 = 760.;
+const SIDEBAR_DEFAULT: f32 = 480.;
+
+/// Editor typography. A single monospace measure is shared by the diff and
+/// source views so both line up column for column, with the ~1.55 line height
+/// a code editor uses rather than the tighter UI leading.
+const EDITOR_FONT: &str = "Menlo";
+const EDITOR_FONT_SIZE: f32 = 13.;
+const EDITOR_LINE_HEIGHT: f32 = 20.;
+
+/// The source file opened in the second tab at startup.
+const DEFAULT_SOURCE: &str = "src/ui/workspace.rs";
 
 struct Workspace {
     focus: FocusHandle,
     history_scroll: gpui::ScrollHandle,
     theme: Theme,
-    editor_view: EditorView,
+    tabs: Vec<Tab>,
+    active_tab: usize,
     commit: usize,
     file: usize,
     files: Vec<FileChange>,
+    /// Directories collapsed in the source tree, by path.
+    collapsed: HashSet<&'static str>,
+    sidebar_width: f32,
+    /// Pointer x and sidebar width captured when a resize drag begins.
+    resize_origin: Option<(f32, f32)>,
     settings_open: bool,
     message: String,
 }
@@ -50,7 +74,7 @@ fn button(
 ) -> Stateful<Div> {
     row()
         .id(id)
-        .h(px(26.))
+        .h(px(28.))
         .px_2()
         .gap_2()
         .rounded(px(4.))
@@ -58,7 +82,7 @@ fn button(
         .border_color(rgb(colors.line_strong))
         .bg(rgb(colors.elevated))
         .text_color(rgb(colors.text))
-        .text_size(px(11.))
+        .text_size(px(13.))
         .cursor_pointer()
         .hover(move |this| this.bg(rgb(colors.hover)))
         .active(|this| this.opacity(0.8))
@@ -76,7 +100,7 @@ fn icon_button(
         .size(px(34.))
         .justify_center()
         .rounded(px(4.))
-        .text_size(px(17.))
+        .text_size(px(19.))
         .text_color(rgb(if selected {
             colors.text_bright
         } else {
@@ -103,10 +127,19 @@ impl Workspace {
             focus,
             history_scroll: gpui::ScrollHandle::new(),
             theme: Theme::Dark,
-            editor_view: EditorView::Diff,
+            tabs: vec![
+                Tab::Diff { file: 0 },
+                Tab::Source {
+                    path: DEFAULT_SOURCE,
+                },
+            ],
+            active_tab: 0,
             commit: 0,
             file: 0,
             files: demo::files(),
+            collapsed: HashSet::new(),
+            sidebar_width: SIDEBAR_DEFAULT,
+            resize_origin: None,
             settings_open: false,
             message: "main*  ·  3 changes  ·  2 staged".into(),
         }
@@ -126,9 +159,63 @@ impl Workspace {
 
     fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
         self.file = index;
-        self.editor_view = EditorView::Diff;
         self.message = format!("{}  ·  working tree", self.files[index].path);
+        self.open_tab(Tab::Diff { file: index }, cx);
+    }
+
+    /// Focuses `tab` if it is already open, otherwise appends it.
+    fn open_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.active_tab = match self.tabs.iter().position(|open| *open == tab) {
+            Some(index) => index,
+            None => {
+                self.tabs.push(tab);
+                self.tabs.len() - 1
+            }
+        };
         cx.notify();
+    }
+
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        // Keep one tab open so the editor always has something to show.
+        if self.tabs.len() == 1 {
+            return;
+        }
+        self.tabs.remove(index);
+        if self.active_tab > index || self.active_tab == self.tabs.len() {
+            self.active_tab -= 1;
+        }
+        cx.notify();
+    }
+
+    fn open_source(&mut self, path: &'static str, cx: &mut Context<Self>) {
+        self.message = format!("{path}  ·  source");
+        self.open_tab(Tab::Source { path }, cx);
+    }
+
+    fn toggle_folder(&mut self, path: &'static str, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(path) {
+            self.collapsed.insert(path);
+        }
+        cx.notify();
+    }
+
+    /// Tree rows that are not inside a collapsed directory.
+    fn visible_tree(&self) -> Vec<&'static demo::TreeEntry> {
+        let mut rows = Vec::new();
+        let mut hidden_below: Option<usize> = None;
+        for entry in demo::TREE {
+            if let Some(depth) = hidden_below {
+                if entry.depth > depth {
+                    continue;
+                }
+                hidden_below = None;
+            }
+            rows.push(entry);
+            if entry.directory && self.collapsed.contains(entry.path) {
+                hidden_below = Some(entry.depth);
+            }
+        }
+        rows
     }
 
     fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
@@ -163,7 +250,7 @@ impl Workspace {
                 row()
                     .w(px(252.))
                     .gap_2()
-                    .text_size(px(12.))
+                    .text_size(px(14.))
                     .text_color(rgb(colors.text_bright))
                     .child(div().text_color(rgb(colors.local)).child("◇"))
                     .child("vgit")
@@ -178,14 +265,14 @@ impl Workspace {
                 row()
                     .flex_1()
                     .max_w(px(470.))
-                    .h(px(24.))
+                    .h(px(26.))
                     .px_3()
                     .justify_center()
                     .rounded(px(5.))
                     .border_1()
                     .border_color(rgb(colors.line_strong))
                     .bg(rgb(colors.elevated))
-                    .text_size(px(11.))
+                    .text_size(px(13.))
                     .text_color(rgb(colors.muted))
                     .child("design-workspace   ·   e7a91c2   ·   main"),
             )
@@ -226,16 +313,35 @@ impl Workspace {
             )
     }
 
+    /// A thin drag handle that resizes the history sidebar.
+    fn sidebar_resizer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let dragging = self.resize_origin.is_some();
+        div()
+            .id("sidebar-resizer")
+            .w(px(5.))
+            .flex_none()
+            .h_full()
+            .cursor_col_resize()
+            .bg(rgb(if dragging { colors.local } else { colors.line }))
+            .hover(move |this| this.bg(rgb(colors.local)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.resize_origin = Some((f32::from(event.position.x), this.sidebar_width));
+                    cx.notify();
+                }),
+            )
+    }
+
     fn graph_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         column()
-            .w(px(420.))
+            .w(px(self.sidebar_width))
             .flex_none()
             .h_full()
             .min_h_0()
             .bg(rgb(colors.sidebar))
-            .border_r_1()
-            .border_color(rgb(colors.line))
             .child(
                 column()
                     .h(px(74.))
@@ -250,20 +356,20 @@ impl Workspace {
                             .child(
                                 div()
                                     .text_color(rgb(colors.muted))
-                                    .text_size(px(14.))
+                                    .text_size(px(16.))
                                     .child("⋯"),
                             ),
                     )
                     .child(
                         row()
-                            .h(px(28.))
+                            .h(px(30.))
                             .px_2()
                             .gap_2()
                             .rounded(px(4.))
                             .border_1()
                             .border_color(rgb(colors.line))
                             .bg(rgb(colors.editor))
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .text_color(rgb(colors.muted))
                             .child("⌕")
                             .child("Filter commits, authors, refs"),
@@ -316,10 +422,11 @@ impl Workspace {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(10.))
+                                    .text_size(px(12.))
                                     .text_color(rgb(colors.dim))
                                     .child(commit.hash),
                             )
+                            .child(badge(colors, commit.branch, colors.branch(commit.lane)))
                             .when(!commit.reference.is_empty(), |this| {
                                 this.child(badge(colors, commit.reference, ref_color))
                             })
@@ -328,7 +435,7 @@ impl Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(11.))
+                                    .text_size(px(13.))
                                     .text_color(rgb(if selected {
                                         colors.text_bright
                                     } else {
@@ -338,10 +445,10 @@ impl Workspace {
                             )
                             .child(
                                 div()
-                                    .w(px(46.))
+                                    .w(px(64.))
                                     .flex_none()
                                     .text_right()
-                                    .text_size(px(9.))
+                                    .text_size(px(11.))
                                     .text_color(rgb(colors.dim))
                                     .child(commit.time),
                             )
@@ -361,7 +468,7 @@ impl Workspace {
                             .h(px(30.))
                             .px_3()
                             .gap_2()
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .text_color(rgb(colors.text))
                             .child(div().text_color(rgb(colors.local)).child("⑂"))
                             .child("main")
@@ -373,7 +480,7 @@ impl Workspace {
                             .h(px(28.))
                             .px_3()
                             .gap_3()
-                            .text_size(px(10.))
+                            .text_size(px(12.))
                             .text_color(rgb(colors.dim))
                             .child(
                                 row()
@@ -399,70 +506,94 @@ impl Workspace {
 
     fn editor_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
-        let file = &self.files[self.file];
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let active = self.active_tab == index;
+                let (marker, marker_color, title) = match *tab {
+                    Tab::Diff { file } => {
+                        let file = &self.files[file];
+                        (
+                            file.status,
+                            colors.local,
+                            format!(
+                                "{} (Working Tree)",
+                                file.path.rsplit('/').next().unwrap_or("file")
+                            ),
+                        )
+                    }
+                    Tab::Source { path } => (
+                        if path.ends_with(".md") { "MD" } else { "RS" },
+                        colors.remote,
+                        path.rsplit('/').next().unwrap_or(path).to_string(),
+                    ),
+                };
+                row()
+                    .id(("editor-tab", index))
+                    .h_full()
+                    .px_3()
+                    .gap_2()
+                    .flex_none()
+                    .border_r_1()
+                    .border_color(rgb(colors.line))
+                    .when(active, |this| {
+                        this.border_t_1()
+                            .border_color(rgb(marker_color))
+                            .bg(rgb(colors.editor))
+                    })
+                    .text_size(px(13.))
+                    .text_color(rgb(if active {
+                        colors.text_bright
+                    } else {
+                        colors.muted
+                    }))
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(rgb(colors.hover)))
+                    .child(div().text_color(rgb(marker_color)).child(marker))
+                    .child(title)
+                    .child(
+                        div()
+                            .id(("close-tab", index))
+                            .px_1()
+                            .rounded(px(3.))
+                            .text_color(rgb(colors.dim))
+                            .cursor_pointer()
+                            .hover(move |this| {
+                                this.bg(rgb(colors.line_strong))
+                                    .text_color(rgb(colors.text_bright))
+                            })
+                            .child("\u{00d7}")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_tab(index, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.active_tab = index;
+                        cx.notify();
+                    }))
+            })
+            .collect::<Vec<_>>();
+
         row()
+            .id("editor-tabs")
             .h(px(35.))
             .flex_none()
+            .overflow_x_scroll()
             .bg(rgb(colors.editor_alt))
             .border_b_1()
             .border_color(rgb(colors.line))
-            .child(
-                row()
-                    .id("diff-tab")
-                    .h_full()
-                    .px_3()
-                    .gap_2()
-                    .border_r_1()
-                    .border_color(rgb(colors.line))
-                    .when(self.editor_view == EditorView::Diff, |this| {
-                        this.border_t_1()
-                            .border_color(rgb(colors.local))
-                            .bg(rgb(colors.editor))
-                    })
-                    .text_size(px(11.))
-                    .text_color(rgb(colors.text))
-                    .cursor_pointer()
-                    .child(div().text_color(rgb(colors.local)).child("M"))
-                    .child(format!(
-                        "{} (Working Tree)",
-                        file.path.rsplit('/').next().unwrap_or("file")
-                    ))
-                    .child(div().text_color(rgb(colors.dim)).child("×"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.editor_view = EditorView::Diff;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                row()
-                    .id("source-tab")
-                    .h_full()
-                    .px_3()
-                    .gap_2()
-                    .border_r_1()
-                    .border_color(rgb(colors.line))
-                    .when(self.editor_view == EditorView::Source, |this| {
-                        this.border_t_1()
-                            .border_color(rgb(colors.remote))
-                            .bg(rgb(colors.editor))
-                    })
-                    .text_size(px(11.))
-                    .text_color(rgb(colors.text))
-                    .cursor_pointer()
-                    .child(div().text_color(rgb(colors.remote)).child("RS"))
-                    .child("workspace.rs")
-                    .child(div().text_color(rgb(colors.dim)).child("×"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.editor_view = EditorView::Source;
-                        cx.notify();
-                    })),
-            )
-            .child(div().flex_1())
+            .children(tabs)
+            .child(div().flex_1().min_w(px(24.)))
     }
 
     fn breadcrumb(&self) -> impl IntoElement {
         let colors = self.colors();
-        let file = &self.files[self.file];
+        let path = match self.tabs[self.active_tab] {
+            Tab::Diff { file } => self.files[file].path,
+            Tab::Source { path } => path,
+        };
         row()
             .h(px(28.))
             .flex_none()
@@ -471,9 +602,9 @@ impl Workspace {
             .border_b_1()
             .border_color(rgb(colors.line))
             .bg(rgb(colors.editor))
-            .text_size(px(10.))
+            .text_size(px(12.))
             .text_color(rgb(colors.muted))
-            .children(file.path.split('/').enumerate().flat_map(|(index, part)| {
+            .children(path.split('/').enumerate().flat_map(|(index, part)| {
                 let mut elements = Vec::new();
                 if index > 0 {
                     elements.push(div().text_color(rgb(colors.dim)).child("›"));
@@ -482,10 +613,9 @@ impl Workspace {
                 elements
             }))
             .child(div().text_color(rgb(colors.dim)).child("›"))
-            .child(if self.editor_view == EditorView::Diff {
-                "Working Tree"
-            } else {
-                "Source"
+            .child(match self.tabs[self.active_tab] {
+                Tab::Diff { .. } => "Working Tree",
+                Tab::Source { .. } => "Source",
             })
     }
 
@@ -497,10 +627,11 @@ impl Workspace {
     ) -> impl IntoElement {
         let colors = self.colors();
         row()
-            .h(px(23.))
+            .h(px(EDITOR_LINE_HEIGHT))
             .flex_none()
-            .font_family("Menlo")
-            .text_size(px(11.))
+            .font_family(EDITOR_FONT)
+            .text_size(px(EDITOR_FONT_SIZE))
+            .line_height(px(EDITOR_LINE_HEIGHT))
             .bg(rgb(match kind {
                 "+" => colors.added_bg,
                 "-" => colors.removed_bg,
@@ -508,7 +639,7 @@ impl Workspace {
             }))
             .child(
                 div()
-                    .w(px(50.))
+                    .w(px(56.))
                     .flex_none()
                     .text_right()
                     .pr_3()
@@ -538,9 +669,9 @@ impl Workspace {
             )
     }
 
-    fn diff_editor(&self) -> impl IntoElement {
+    fn diff_editor(&self, index: usize) -> impl IntoElement {
         let colors = self.colors();
-        let file = &self.files[self.file];
+        let file = &self.files[index];
         column()
             .id("diff-editor")
             .flex_1()
@@ -561,24 +692,25 @@ impl Workspace {
                     .child(
                         div()
                             .text_color(rgb(colors.local))
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .child(format!("+{}", file.added)),
                     )
                     .child(
                         div()
                             .text_color(rgb(colors.red))
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .child(format!("−{}", file.removed)),
                     ),
             )
             .child(
                 div()
-                    .h(px(28.))
+                    .h(px(EDITOR_LINE_HEIGHT + 6.))
                     .flex_none()
                     .px_4()
                     .py_1()
-                    .font_family("Menlo")
-                    .text_size(px(10.))
+                    .font_family(EDITOR_FONT)
+                    .text_size(px(EDITOR_FONT_SIZE))
+                    .line_height(px(EDITOR_LINE_HEIGHT))
                     .text_color(rgb(colors.remote))
                     .child("@@ -18,10 +18,12 @@ impl Render for Workspace"),
             )
@@ -590,37 +722,8 @@ impl Workspace {
             )
     }
 
-    fn source_editor(&self) -> impl IntoElement {
+    fn source_editor(&self, path: &'static str) -> impl IntoElement {
         let colors = self.colors();
-        let source = [
-            (1, "use gpui::{Context, IntoElement, Render};"),
-            (2, "use crate::{graph::HistoryGraph, theme::Theme};"),
-            (3, ""),
-            (4, "pub struct Workspace {"),
-            (5, "    graph: HistoryGraph,"),
-            (6, "    theme: Theme,"),
-            (7, "    selected_commit: usize,"),
-            (8, "}"),
-            (9, ""),
-            (10, "impl Render for Workspace {"),
-            (
-                11,
-                "    fn render(&mut self, cx: &mut Context<Self>) -> impl IntoElement {",
-            ),
-            (12, "        let colors = self.theme.palette();"),
-            (13, ""),
-            (14, "        workspace_shell(colors)"),
-            (15, "            .left(self.graph.render(cx))"),
-            (16, "            .center(self.diff_editor(cx))"),
-            (17, "            .right(self.repository_state(cx))"),
-            (18, "    }"),
-            (19, "}"),
-            (20, ""),
-            (
-                21,
-                "// The interface is native Rust and all data is still fictional.",
-            ),
-        ];
         column()
             .id("source-editor")
             .flex_1()
@@ -628,7 +731,12 @@ impl Workspace {
             .overflow_scroll()
             .bg(rgb(colors.editor))
             .py_2()
-            .children(source.map(|(line, code)| self.code_line(line, " ", code)))
+            .children(
+                demo::source(path)
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, code)| self.code_line(offset + 1, " ", code)),
+            )
     }
 
     fn editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -640,9 +748,9 @@ impl Workspace {
             .bg(rgb(colors.editor))
             .child(self.editor_tabs(cx))
             .child(self.breadcrumb())
-            .child(match self.editor_view {
-                EditorView::Diff => self.diff_editor().into_any_element(),
-                EditorView::Source => self.source_editor().into_any_element(),
+            .child(match self.tabs[self.active_tab] {
+                Tab::Diff { file } => self.diff_editor(file).into_any_element(),
+                Tab::Source { path } => self.source_editor(path).into_any_element(),
             })
     }
 
@@ -658,7 +766,7 @@ impl Workspace {
                 },
                 index,
             ))
-            .h(px(26.))
+            .h(px(28.))
             .px_2()
             .gap_2()
             .cursor_pointer()
@@ -672,7 +780,7 @@ impl Workspace {
                 div()
                     .w(px(13.))
                     .flex_none()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(if file.status == "M" {
                         colors.remote
                     } else {
@@ -685,12 +793,12 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.))
+                    .text_size(px(13.))
                     .text_color(rgb(colors.text))
                     .child(file.path.rsplit('/').next().unwrap_or(file.path)),
             )
             .child(
-                div().text_size(px(9.)).text_color(rgb(colors.dim)).child(
+                div().text_size(px(11.)).text_color(rgb(colors.dim)).child(
                     file.path
                         .rsplit_once('/')
                         .map(|value| value.0)
@@ -702,7 +810,7 @@ impl Workspace {
                     .id(("stage-toggle", index))
                     .w(px(18.))
                     .text_center()
-                    .text_size(px(14.))
+                    .text_size(px(16.))
                     .text_color(rgb(colors.muted))
                     .cursor_pointer()
                     .child(if staged { "−" } else { "+" })
@@ -727,7 +835,7 @@ impl Workspace {
                     .child(section_label(colors, "REPOSITORY STATE"))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(15.))
                             .text_color(rgb(colors.dim))
                             .child("⌃"),
                     ),
@@ -739,16 +847,16 @@ impl Workspace {
                     .gap_2()
                     .child(
                         row()
-                            .text_size(px(11.))
-                            .child(div().w(px(74.)).text_color(rgb(colors.muted)).child("HEAD"))
+                            .text_size(px(13.))
+                            .child(div().w(px(86.)).text_color(rgb(colors.muted)).child("HEAD"))
                             .child(div().text_color(rgb(colors.local)).child("main")),
                     )
                     .child(
                         row()
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .child(
                                 div()
-                                    .w(px(74.))
+                                    .w(px(86.))
                                     .text_color(rgb(colors.muted))
                                     .child("Upstream"),
                             )
@@ -756,10 +864,10 @@ impl Workspace {
                     )
                     .child(
                         row()
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .child(
                                 div()
-                                    .w(px(74.))
+                                    .w(px(86.))
                                     .text_color(rgb(colors.muted))
                                     .child("Status"),
                             )
@@ -771,10 +879,10 @@ impl Workspace {
                     )
                     .child(
                         row()
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .child(
                                 div()
-                                    .w(px(74.))
+                                    .w(px(86.))
                                     .text_color(rgb(colors.muted))
                                     .child("Commit"),
                             )
@@ -790,13 +898,13 @@ impl Workspace {
                             .child(section_label(colors, "SELECTED COMMIT"))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(px(13.))
                                     .text_color(rgb(colors.text))
                                     .child(commit.subject),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(px(12.))
                                     .text_color(rgb(colors.dim))
                                     .child(format!("{} · {}", commit.author, commit.description)),
                             ),
@@ -822,13 +930,78 @@ impl Workspace {
             .filter(|(_, file)| file.staged)
             .map(|(index, _)| self.file_row(index, true, cx).into_any_element())
             .collect::<Vec<_>>();
+        let open_source = match self.tabs[self.active_tab] {
+            Tab::Source { path } => Some(path),
+            Tab::Diff { .. } => None,
+        };
+        let tree_rows = self
+            .visible_tree()
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let collapsed = self.collapsed.contains(entry.path);
+                let selected = open_source == Some(entry.path);
+                let (glyph, glyph_color) = if entry.directory {
+                    (if collapsed { "›" } else { "⌄" }, colors.muted)
+                } else if entry.path.ends_with(".md") {
+                    ("#", colors.muted)
+                } else {
+                    ("RS", colors.remote)
+                };
+                let path = entry.path;
+                row()
+                    .id(("tree-row", index))
+                    .h(px(26.))
+                    .pl(px(12. + entry.depth as f32 * 14.))
+                    .pr_3()
+                    .gap_2()
+                    .cursor_pointer()
+                    .bg(rgb(if selected {
+                        colors.selection
+                    } else {
+                        colors.panel
+                    }))
+                    .hover(move |this| this.bg(rgb(colors.hover)))
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .flex_none()
+                            .font_family(EDITOR_FONT)
+                            .text_size(px(11.))
+                            .text_color(rgb(glyph_color))
+                            .child(glyph),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.))
+                            .text_color(rgb(if entry.directory {
+                                colors.text
+                            } else if selected {
+                                colors.text_bright
+                            } else {
+                                colors.muted
+                            }))
+                            .child(entry.name),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if entry.directory {
+                            this.toggle_folder(path, cx);
+                        } else {
+                            this.open_source(path, cx);
+                        }
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         column()
             .id("repository-sidebar")
             .w(px(320.))
             .flex_none()
             .h_full()
             .min_h_0()
-            .overflow_y_scroll()
             .bg(rgb(colors.panel))
             .border_l_1()
             .border_color(rgb(colors.line))
@@ -843,91 +1016,77 @@ impl Workspace {
                     .child(section_label(colors, "SOURCE CONTROL"))
                     .child(
                         div()
-                            .text_size(px(14.))
+                            .text_size(px(16.))
                             .text_color(rgb(colors.muted))
                             .child("⋯"),
                     ),
             )
             .child(self.repository_state())
-            .child(div().h(px(1.)).bg(rgb(colors.line)))
-            .child(
-                row()
-                    .h(px(28.))
-                    .px_3()
-                    .gap_2()
-                    .child(div().text_color(rgb(colors.muted)).child("⌄"))
-                    .child(section_label(colors, format!("CHANGES  {changed_count}")))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .text_color(rgb(colors.muted))
-                            .child("＋"),
-                    ),
-            )
-            .children(changed_rows)
-            .child(
-                row()
-                    .h(px(28.))
-                    .px_3()
-                    .gap_2()
-                    .mt_2()
-                    .border_t_1()
-                    .border_color(rgb(colors.line))
-                    .child(div().text_color(rgb(colors.muted)).child("⌄"))
-                    .child(section_label(
-                        colors,
-                        format!("STAGED CHANGES  {staged_count}"),
-                    ))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .text_color(rgb(colors.muted))
-                            .child("−"),
-                    ),
-            )
-            .children(staged_rows)
+            .child(div().h(px(1.)).flex_none().bg(rgb(colors.line)))
             .child(
                 column()
-                    .mt_2()
-                    .border_t_1()
-                    .border_color(rgb(colors.line))
+                    .id("repository-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .child(
                         row()
                             .h(px(28.))
+                            .flex_none()
                             .px_3()
                             .gap_2()
                             .child(div().text_color(rgb(colors.muted)).child("⌄"))
-                            .child(section_label(colors, "SOURCE FILE TREE")),
+                            .child(section_label(colors, format!("CHANGES  {changed_count}")))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_size(px(17.))
+                                    .text_color(rgb(colors.muted))
+                                    .child("＋"),
+                            ),
                     )
-                    .children(
-                        [
-                            ("⌄", "src", colors.text),
-                            ("  ⌄", "ui", colors.text),
-                            ("    RS", "workspace.rs", colors.remote),
-                            ("    RS", "theme.rs", colors.remote),
-                            ("  ⌄", "graph", colors.text),
-                            ("    RS", "renderer.rs", colors.remote),
-                            ("  RS", "core/session.rs", colors.remote),
-                            ("⌄", "docs", colors.text),
-                            ("  #", "design-notes.md", colors.muted),
-                        ]
-                        .map(|(prefix, name, color)| {
-                            row()
-                                .h(px(24.))
-                                .px_3()
-                                .gap_2()
-                                .text_size(px(11.))
-                                .text_color(rgb(color))
-                                .child(div().font_family("Menlo").text_size(px(9.)).child(prefix))
-                                .child(name)
-                        }),
+                    .children(changed_rows)
+                    .child(
+                        row()
+                            .h(px(28.))
+                            .flex_none()
+                            .px_3()
+                            .gap_2()
+                            .mt_2()
+                            .border_t_1()
+                            .border_color(rgb(colors.line))
+                            .child(div().text_color(rgb(colors.muted)).child("⌄"))
+                            .child(section_label(
+                                colors,
+                                format!("STAGED CHANGES  {staged_count}"),
+                            ))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_size(px(17.))
+                                    .text_color(rgb(colors.muted))
+                                    .child("−"),
+                            ),
+                    )
+                    .children(staged_rows)
+                    .child(
+                        column()
+                            .mt_2()
+                            .border_t_1()
+                            .border_color(rgb(colors.line))
+                            .child(
+                                row()
+                                    .h(px(28.))
+                                    .px_3()
+                                    .gap_2()
+                                    .child(section_label(colors, "SOURCE FILE TREE")),
+                            )
+                            .children(tree_rows),
                     ),
             )
-            .child(div().flex_1())
             .child(
                 column()
+                    .flex_none()
                     .p_3()
                     .gap_2()
                     .border_t_1()
@@ -940,19 +1099,19 @@ impl Workspace {
                             .border_1()
                             .border_color(rgb(colors.line_strong))
                             .bg(rgb(colors.editor))
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .text_color(rgb(colors.dim))
                             .child("Message (Ctrl+Enter to commit)"),
                     )
                     .child(
                         row()
-                            .h(px(26.))
+                            .h(px(28.))
                             .justify_center()
                             .rounded(px(4.))
                             .bg(rgb(colors.local))
                             .text_color(rgb(colors.editor))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .child("Commit  ·  demo"),
                     ),
             )
@@ -985,7 +1144,7 @@ impl Workspace {
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(12.))
+                            .text_size(px(14.))
                             .text_color(rgb(colors.text_bright))
                             .child("Settings"),
                     )
@@ -1054,7 +1213,7 @@ impl Workspace {
                             .child(
                                 row()
                                     .justify_between()
-                                    .text_size(px(11.))
+                                    .text_size(px(13.))
                                     .text_color(rgb(colors.text))
                                     .child(theme.label())
                                     .when(selected, |this| {
@@ -1068,7 +1227,7 @@ impl Workspace {
             )
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(colors.dim))
                     .child("Theme is kept for this preview session."),
             )
@@ -1077,13 +1236,13 @@ impl Workspace {
     fn statusbar(&self) -> impl IntoElement {
         let colors = self.colors();
         row()
-            .h(px(22.))
+            .h(px(24.))
             .flex_none()
             .px_2()
             .gap_3()
             .bg(rgb(colors.local))
             .text_color(rgb(colors.editor))
-            .text_size(px(10.))
+            .text_size(px(12.))
             .child("⑂ main*")
             .child("↻")
             .child("ⓧ 0")
@@ -1108,7 +1267,7 @@ impl Render for Workspace {
             .bg(rgb(colors.app))
             .font_family(".SystemUIFont")
             .text_color(rgb(colors.text))
-            .text_size(px(12.))
+            .text_size(px(14.))
             .on_action(cx.listener(|this, _: &NextCommit, _, cx| {
                 this.select_commit((this.commit + 1) % COMMITS.len(), cx);
             }))
@@ -1116,12 +1275,20 @@ impl Render for Workspace {
                 this.select_commit((this.commit + COMMITS.len() - 1) % COMMITS.len(), cx);
             }))
             .on_action(cx.listener(|this, _: &ShowDiff, _, cx| {
-                this.editor_view = EditorView::Diff;
-                cx.notify();
+                this.open_tab(Tab::Diff { file: this.file }, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowSource, _, cx| {
-                this.editor_view = EditorView::Source;
-                cx.notify();
+                match this
+                    .tabs
+                    .iter()
+                    .position(|tab| matches!(tab, Tab::Source { .. }))
+                {
+                    Some(index) => {
+                        this.active_tab = index;
+                        cx.notify();
+                    }
+                    None => this.open_source(DEFAULT_SOURCE, cx),
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleStage, _, cx| {
                 this.toggle_stage(this.file, cx);
@@ -1135,6 +1302,30 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(|_: &Close, window, _| window.remove_window())
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                let Some((origin_x, origin_width)) = this.resize_origin else {
+                    return;
+                };
+                if event.pressed_button != Some(MouseButton::Left) {
+                    this.resize_origin = None;
+                    cx.notify();
+                    return;
+                }
+                let width = origin_width + f32::from(event.position.x) - origin_x;
+                let width = width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                if width != this.sidebar_width {
+                    this.sidebar_width = width;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    if this.resize_origin.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(self.titlebar(cx))
             .child(
                 div()
@@ -1144,6 +1335,7 @@ impl Render for Workspace {
                     .overflow_hidden()
                     .child(self.activity_bar(cx))
                     .child(self.graph_sidebar(cx))
+                    .child(self.sidebar_resizer(cx))
                     .child(self.editor(cx))
                     .child(self.right_sidebar(cx)),
             )

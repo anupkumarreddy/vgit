@@ -120,7 +120,7 @@ pub fn column() -> Div {
 
 pub fn section_label(colors: Palette, text: impl Into<String>) -> Div {
     div()
-        .text_size(px(10.))
+        .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(colors.muted))
         .child(text.into())
@@ -134,6 +134,6 @@ pub fn badge(_colors: Palette, text: impl Into<String>, color: u32) -> Div {
         .rounded(px(3.))
         .bg(gpui::rgba((color << 8) | 26))
         .text_color(rgb(color))
-        .text_size(px(10.))
+        .text_size(px(12.))
         .child(text.into())
 }
